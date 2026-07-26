@@ -22,6 +22,6 @@
     "react-native-vision-camera": "^4.7.3"
   },
   "devDependencies": {
-    "eas-cli": "^13.2.0"
+    "@expo/config-plugins": "~8.0.0"
   }
 }
