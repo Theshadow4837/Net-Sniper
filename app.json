@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Net Sniper",
-    "slug": "shot-tracker",
+    "slug": "net-sniper",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -11,14 +11,12 @@
       "resizeMode": "contain",
       "backgroundColor": "#0A121C"
     },
-    "assetBundlePatterns": [
-      "**/*"
-    ],
+    "assetBundlePatterns": ["**/*"],
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.netsniper.app",
       "infoPlist": {
-        "NSCameraUsageDescription": "Net Sniper needs camera access to show the net and track shots."
+        "NSCameraUsageDescription": "Net Sniper uses the camera to show live video of the net while you track your shots."
       }
     },
     "android": {
@@ -27,10 +25,7 @@
         "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#0A121C"
       },
-      "permissions": [
-        "CAMERA",
-        "android.permission.CAMERA"
-      ]
+      "permissions": ["CAMERA"]
     },
     "plugins": [
       [
@@ -40,12 +35,6 @@
           "enableMicrophonePermission": false
         }
       ]
-    ],
-    "extra": {
-      "eas": {
-        "projectId": "1537fd96-4bef-45a7-b529-ccd2e8e565c8"
-      }
-    },
-    "owner": "janiks-projects"
+    ]
   }
 }

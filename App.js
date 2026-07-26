@@ -6,7 +6,7 @@ import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import Svg, { Circle, Rect } from "react-native-svg";
 import {
-  Camera, useCameraDevice, useCameraFormat, useCameraPermission,
+  Camera, useCameraDevice, useCameraPermission,
 } from "react-native-vision-camera";
 
 // ---------- palette (matches the web version) ----------
@@ -49,14 +49,34 @@ export default function App() {
 
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice(facing === "back" ? "back" : "front");
-  // Ask vision-camera for the highest-fps format available for this device —
-  // this is the actual win over the browser: native camera pipelines expose
-  // 120/240fps sensor modes that getUserMedia can't reliably reach.
-  const format = useCameraFormat(device, [
-    { fps: 240 },
-    { videoResolution: { width: 640, height: 480 } },
-  ]);
+  // useCameraFormat balances several criteria (resolution match, photo size,
+  // etc.) and doesn't reliably just pick "max fps" — so instead we scan
+  // device.formats ourselves and explicitly pick the format with the highest
+  // maxFps among the low-resolution options (phones only unlock their
+  // 120/240fps sensor modes at reduced resolution).
+  const format = React.useMemo(() => {
+    if (!device || !device.formats || device.formats.length === 0) return undefined;
+    const small = device.formats.filter((f) => f.videoWidth <= 1280 && f.videoHeight <= 720);
+    const pool = small.length ? small : device.formats;
+    return pool.reduce((best, f) => {
+      if (!best) return f;
+      const fMax = f.maxFps ?? 0, bestMax = best.maxFps ?? 0;
+      if (fMax > bestMax) return f;
+      if (fMax === bestMax && f.videoWidth * f.videoHeight < best.videoWidth * best.videoHeight) return f;
+      return best;
+    }, undefined);
+  }, [device]);
   const maxFps = format?.maxFps ?? null;
+
+  useEffect(() => {
+    if (device && format) {
+      console.log(
+        "Selected format:", format.videoWidth + "x" + format.videoHeight,
+        "| maxFps:", format.maxFps,
+        "| total formats available:", device.formats?.length
+      );
+    }
+  }, [device, format]);
 
   useEffect(() => {
     (async () => {
@@ -284,11 +304,11 @@ export default function App() {
             <IconBtn label="✕" onPress={resetSetup} />
           </View>
 
-          {maxFps ? (
-            <View style={s.fpsPillWrap}>
-              <Text style={s.fpsPillText}>📹 up to {Math.round(maxFps)} fps</Text>
-            </View>
-          ) : null}
+          <View style={s.fpsPillWrap}>
+            <Text style={s.fpsPillText}>
+              📹 {maxFps ? `up to ${Math.round(maxFps)} fps` : device ? "detecting fps…" : "no camera device"}
+            </Text>
+          </View>
 
           <View style={s.bottomPanel} pointerEvents="box-none">
             <Text style={s.hint}>{hint}</Text>
@@ -329,7 +349,7 @@ export default function App() {
 
           <View style={s.hudTop}>
             <Text style={s.timerText}>{fmtMMSS(elapsed)}</Text>
-            {maxFps ? <Text style={s.fpsPillText}>{Math.round(maxFps)} fps</Text> : null}
+            {maxFps ? <Text style={s.fpsPillText}>{Math.round(maxFps)} fps</Text> : <Text style={s.fpsPillText}>fps: n/a</Text>}
           </View>
           <View style={s.hudStats}>
             <Pill n={current?.totalShots ?? 0} l="Shots" c={C.ice} />
