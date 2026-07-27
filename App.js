@@ -3,7 +3,6 @@ import {
   Alert,
   Modal,
   PanResponder,
-  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -15,10 +14,6 @@ import {
 } from "react-native";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { registerWidgetTaskHandler, requestWidgetUpdate } from "react-native-android-widget";
-import { widgetTaskHandler } from "./widget-task-handler";
-import { StreakWidget } from "./widgets/StreakWidget";
-import { computeDisplayStreak, dateKeyFor, isConsecutiveDay } from "./streakLogic";
 import Slider from "@react-native-community/slider";
 import Svg, { Circle, Defs, Ellipse, LinearGradient, Rect, Stop, Text as SvgText } from "react-native-svg";
 import { Worklets } from "react-native-worklets-core";
@@ -81,10 +76,25 @@ function targetSizeLabel(v) {
   return "Large";
 }
 
-// Registers the headless task Android uses to redraw the home screen
-// widget. Guarded to Android only so this never touches the iOS bundle.
-if (Platform.OS === "android") {
-  registerWidgetTaskHandler(widgetTaskHandler);
+function dateKeyFor(d) {
+  // Local calendar day (respects the device's timezone), not UTC.
+  return d.toDateString();
+}
+
+function isConsecutiveDay(prevKey, todayDate) {
+  if (!prevKey) return false;
+  const y = new Date(todayDate);
+  y.setDate(todayDate.getDate() - 1);
+  return prevKey === dateKeyFor(y);
+}
+
+function computeDisplayStreak(streak, now) {
+  if (!streak || !streak.lastDate || !streak.count) return 0;
+  const today = dateKeyFor(now);
+  if (streak.lastDate === today) return streak.count;
+  if (isConsecutiveDay(streak.lastDate, now)) return streak.count;
+  // A day was missed without a qualifying session - streak is gone.
+  return 0;
 }
 
 export default function App() {
@@ -605,19 +615,6 @@ export default function App() {
       AsyncStorage.setItem(K_SESSIONS, JSON.stringify(newLog)),
       AsyncStorage.setItem(K_STREAK, JSON.stringify(newStreak)),
     ]);
-
-    if (Platform.OS === "android") {
-      const widgetStreak = computeDisplayStreak(newStreak, new Date());
-      try {
-        await requestWidgetUpdate({
-          widgetName: "StreakWidget",
-          renderWidget: () => <StreakWidget streak={widgetStreak} />,
-        });
-      } catch {
-        // Widget refresh is best-effort - never block finishing the session on it.
-      }
-    }
-
     setScreen("summary");
   }
 

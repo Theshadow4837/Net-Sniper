@@ -49,21 +49,6 @@
             "minSdkVersion": 26
           }
         }
-      ],
-      [
-        "react-native-android-widget",
-        {
-          "widgets": [
-            {
-              "name": "StreakWidget",
-              "label": "Net Sniper Streak",
-              "description": "Shows your current session streak",
-              "minWidth": "180dp",
-              "minHeight": "110dp",
-              "resizeMode": "horizontal|vertical"
-            }
-          ]
-        }
       ]
     ],
     "extra": {
