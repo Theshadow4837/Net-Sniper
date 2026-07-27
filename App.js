@@ -1,9 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
+  Modal,
+  PanResponder,
   Pressable,
   SafeAreaView,
   ScrollView,
+  Share,
   StatusBar,
   StyleSheet,
   Text,
@@ -33,38 +36,29 @@ const C = {
 const K_TOTALS = "netsniper:totals";
 const K_LATEST = "netsniper:latest";
 const K_SESSIONS = "netsniper:sessions";
+const K_SETTINGS = "netsniper:settings";
+const K_STREAK = "netsniper:streak";
+const K_TUTORIAL_SEEN = "netsniper:tutorialSeen";
 const REF_WIDTH = 380;
-// Detection tuning: grid density scales with the net box's actual pixel size,
-// so a small or distant puck still gets sampled finely instead of falling
-// between coarse cells.
-const SAMPLE_SPACING_PX = 5; // aim for one sample roughly every 5px of net box
+// Detection tuning defaults. These are now user-adjustable in the Settings
+// screen; these values are exactly what the app previously hardcoded, so
+// behavior is unchanged until someone edits a setting.
+const DEFAULT_SETTINGS = {
+  sampleSpacingPx: 5,
+  motionDiffMin: 22,
+  motionDiffNoiseMult: 3.2,
+  minChangedSamples: 3,
+  maxChangedRatio: 0.55,
+  clusterMaxSpanRatio: 0.65,
+  motionOnsetFrames: 2,
+  motionEndQuietFrames: 4,
+  shotCooldownMs: 900,
+  hitRadiusMult: 1.35,
+};
 const MIN_GRID = 14;
 const MAX_GRID_COLS = 64;
 const MAX_GRID_ROWS = 48;
-// Motion threshold is adaptive (based on this frame's measured sensor noise)
-// instead of a fixed brightness delta, so it stays sensitive in varied lighting
-// without tripping on tiny sensor jitter.
-const MOTION_DIFF_MIN = 22;
-const MOTION_DIFF_NOISE_MULT = 3.2;
-// Absolute minimum changed cells (not a % of the whole box) so a puck that's
-// only a handful of pixels wide (i.e. far away) can still register, while a
-// single stray cell (jitter) does not.
-const MIN_CHANGED_SAMPLES = 3;
-// Guards against false positives: ignore changes that cover most of the box
-// (lighting flicker, camera shake, a hand entering frame) or that are spread
-// out rather than compact like a real puck.
-const MAX_CHANGED_RATIO = 0.55;
-const CLUSTER_MAX_SPAN_RATIO = 0.65;
-// Shot lifecycle: a "shot" is a whole motion event, not a single frame. We
-// require a couple consecutive motion frames to confirm it's really starting
-// (filters single-frame jitter), track it continuously while motion
-// continues (a bounce/wobble after impact still belongs to the SAME shot),
-// and only finalize + count it once motion has been quiet for a few frames.
-// A cooldown after finalizing then blocks the net's own post-impact ripple
-// from being read as a brand new shot.
-const MOTION_ONSET_FRAMES = 2;
-const MOTION_END_QUIET_FRAMES = 4;
-const SHOT_COOLDOWN_MS = 900;
+const DEFAULT_TARGET_RADIUS = 34;
 
 function pct(on, total) {
   return total ? Math.round((on / total) * 100) : 0;
@@ -82,17 +76,43 @@ function targetSizeLabel(v) {
   return "Large";
 }
 
+function dateKeyFor(d) {
+  // Local calendar day (respects the device's timezone), not UTC.
+  return d.toDateString();
+}
+
+function isConsecutiveDay(prevKey, todayDate) {
+  if (!prevKey) return false;
+  const y = new Date(todayDate);
+  y.setDate(todayDate.getDate() - 1);
+  return prevKey === dateKeyFor(y);
+}
+
+function computeDisplayStreak(streak, now) {
+  if (!streak || !streak.lastDate || !streak.count) return 0;
+  const today = dateKeyFor(now);
+  if (streak.lastDate === today) return streak.count;
+  if (isConsecutiveDay(streak.lastDate, now)) return streak.count;
+  // A day was missed without a qualifying session - streak is gone.
+  return 0;
+}
+
 export default function App() {
   const [screen, setScreen] = useState("menu");
   const [totals, setTotals] = useState({ totalShots: 0, onTarget: 0, missed: 0 });
   const [latest, setLatest] = useState(null);
   const [sessionsLog, setSessionsLog] = useState([]);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [streak, setStreak] = useState({ count: 0, lastDate: null });
+  const [showTutorial, setShowTutorial] = useState(false);
+  const [tutorialStep, setTutorialStep] = useState(0);
 
   const [facing, setFacing] = useState("back");
   const [netBox, setNetBox] = useState(null);
   const [setupStage, setSetupStage] = useState("netcorner1");
   const [targets, setTargets] = useState([]);
-  const [targetRadius, setTargetRadius] = useState(34);
+  const [targetRadius, setTargetRadius] = useState(DEFAULT_TARGET_RADIUS);
+  const [selectedTargetIndex, setSelectedTargetIndex] = useState(null);
   const [layout, setLayout] = useState({ w: 1, h: 1 });
 
   const [current, setCurrent] = useState(null);
@@ -154,6 +174,7 @@ export default function App() {
     // small, fast-moving pucks: more samples per second means the puck can't
     // "skip over" the net box between processed frames.
     const targetFps = maxFps || 30;
+    const cfg = settings;
     runAtTargetFps(targetFps, () => {
       "worklet";
       if (!autoDetectOn || isPaused || !netBox || netBox.x2 === undefined || targets.length === 0) {
@@ -198,8 +219,8 @@ export default function App() {
       // enough sample cells to be seen, instead of a fixed coarse 20x14 grid.
       const boxWidthPx = Math.max(1, (right - left) * fw);
       const boxHeightPx = Math.max(1, (bottom - top) * fh);
-      let cols = Math.round(boxWidthPx / SAMPLE_SPACING_PX);
-      let rows = Math.round(boxHeightPx / SAMPLE_SPACING_PX);
+      let cols = Math.round(boxWidthPx / cfg.sampleSpacingPx);
+      let rows = Math.round(boxHeightPx / cfg.sampleSpacingPx);
       cols = Math.max(MIN_GRID, Math.min(MAX_GRID_COLS, cols));
       rows = Math.max(MIN_GRID, Math.min(MAX_GRID_ROWS, rows));
       const totalSamples = cols * rows;
@@ -244,7 +265,7 @@ export default function App() {
       // assuming a fixed brightness delta, so sensitivity holds up across
       // different lighting and camera sensors.
       const avgDiff = sumDiff / diffCount;
-      const threshold = Math.max(MOTION_DIFF_MIN, avgDiff * MOTION_DIFF_NOISE_MULT);
+      const threshold = Math.max(cfg.motionDiffMin, avgDiff * cfg.motionDiffNoiseMult);
 
       let changed = 0;
       let sumX = 0;
@@ -281,20 +302,20 @@ export default function App() {
       // camera shake, a hand entering frame) and changes spread too thin to be
       // a compact object.
       const isMotion =
-        changed >= MIN_CHANGED_SAMPLES &&
-        changedRatio <= MAX_CHANGED_RATIO &&
-        !(spanCols > CLUSTER_MAX_SPAN_RATIO && spanRows > CLUSTER_MAX_SPAN_RATIO);
+        changed >= cfg.minChangedSamples &&
+        changedRatio <= cfg.maxChangedRatio &&
+        !(spanCols > cfg.clusterMaxSpanRatio && spanRows > cfg.clusterMaxSpanRatio);
 
       const cx = sumX / changed;
       const cy = sumY / changed;
-      const radiusNorm = (targetRadius / REF_WIDTH) * 1.35;
 
       const checkHit = (fromCentroid, toX, toY) => {
         for (let i = 0; i < targets.length; i += 1) {
           const t = targets[i];
+          const rNorm = ((t.radius || 34) / REF_WIDTH) * cfg.hitRadiusMult;
           const dx = toX - t.x;
           const dy = toY - t.y;
-          if (Math.sqrt(dx * dx + dy * dy) <= radiusNorm) return true;
+          if (Math.sqrt(dx * dx + dy * dy) <= rNorm) return true;
           if (fromCentroid) {
             const segSteps = 4;
             for (let step = 1; step <= segSteps; step += 1) {
@@ -302,7 +323,7 @@ export default function App() {
               const fy = fromCentroid.y + ((toY - fromCentroid.y) * step) / segSteps;
               const ddx = fx - t.x;
               const ddy = fy - t.y;
-              if (Math.sqrt(ddx * ddx + ddy * ddy) <= radiusNorm) return true;
+              if (Math.sqrt(ddx * ddx + ddy * ddy) <= rNorm) return true;
             }
           }
         }
@@ -314,7 +335,7 @@ export default function App() {
         if (state === "active") {
           const quiet = (global.__netSniperQuietCount || 0) + 1;
           global.__netSniperQuietCount = quiet;
-          if (quiet >= MOTION_END_QUIET_FRAMES) {
+          if (quiet >= cfg.motionEndQuietFrames) {
             // Motion has fully stopped - the shot is over. Finalize it exactly
             // once, whether or not it ever registered as a hit.
             const finalHit = !!global.__netSniperActiveHit;
@@ -322,7 +343,7 @@ export default function App() {
             global.__netSniperActiveHit = false;
             global.__netSniperQuietCount = 0;
             global.__netSniperOnsetCount = 0;
-            global.__netSniperCooldownUntil = now + SHOT_COOLDOWN_MS;
+            global.__netSniperCooldownUntil = now + cfg.shotCooldownMs;
             onFrameShot(finalHit);
           }
         } else {
@@ -336,7 +357,7 @@ export default function App() {
         const onset = (global.__netSniperOnsetCount || 0) + 1;
         global.__netSniperOnsetCount = onset;
         global.__netSniperPrevCentroid = { x: cx, y: cy };
-        if (onset >= MOTION_ONSET_FRAMES) {
+        if (onset >= cfg.motionOnsetFrames) {
           // Confirmed as a real shot starting, not a single-frame flicker.
           global.__netSniperState = "active";
           global.__netSniperQuietCount = 0;
@@ -355,7 +376,7 @@ export default function App() {
       }
       global.__netSniperPrevCentroid = { x: cx, y: cy };
     });
-  }, [autoDetectOn, isPaused, netBox, targets, targetRadius, maxFps, onFrameShot]);
+  }, [autoDetectOn, isPaused, netBox, targets, settings, maxFps, onFrameShot]);
 
   useEffect(() => {
     if (!hasPermission) {
@@ -381,14 +402,20 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [t, l, s] = await Promise.all([
+        const [t, l, sess, set, str, tut] = await Promise.all([
           AsyncStorage.getItem(K_TOTALS),
           AsyncStorage.getItem(K_LATEST),
           AsyncStorage.getItem(K_SESSIONS),
+          AsyncStorage.getItem(K_SETTINGS),
+          AsyncStorage.getItem(K_STREAK),
+          AsyncStorage.getItem(K_TUTORIAL_SEEN),
         ]);
         if (t) setTotals(JSON.parse(t));
         if (l) setLatest(JSON.parse(l));
-        if (s) setSessionsLog(JSON.parse(s));
+        if (sess) setSessionsLog(JSON.parse(sess));
+        if (set) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(set) });
+        if (str) setStreak(JSON.parse(str));
+        if (!tut) setShowTutorial(true);
       } catch {
         // Bad saved data should not block opening the app.
       }
@@ -403,18 +430,59 @@ export default function App() {
     if (timerRef.current) clearInterval(timerRef.current);
   }, []);
 
-  const radiusPx = useCallback((width) => (targetRadius / REF_WIDTH) * width, [targetRadius]);
+  const radiusPx = useCallback((r, width) => (r / REF_WIDTH) * width, []);
 
   function resetSetup() {
     setNetBox(null);
     setTargets([]);
     setSetupStage("netcorner1");
-    setTargetRadius(34);
+    setTargetRadius(DEFAULT_TARGET_RADIUS);
+    setSelectedTargetIndex(null);
   }
 
   function enterSetup() {
     resetSetup();
     setScreen("setup");
+  }
+
+  function persistSettings(next) {
+    setSettings(next);
+    AsyncStorage.setItem(K_SETTINGS, JSON.stringify(next)).catch(() => {});
+  }
+
+  function updateSetting(key, value) {
+    persistSettings({ ...settings, [key]: value });
+  }
+
+  function resetSettingsToDefault() {
+    Alert.alert("Reset calibration?", "This restores all detection settings to their defaults.", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Reset", style: "destructive", onPress: () => persistSettings(DEFAULT_SETTINGS) },
+    ]);
+  }
+
+  function dismissTutorial() {
+    setShowTutorial(false);
+    setTutorialStep(0);
+    AsyncStorage.setItem(K_TUTORIAL_SEEN, "1").catch(() => {});
+  }
+
+  async function shareStats(rec) {
+    const isSession = !!rec;
+    const src = isSession ? rec : totals;
+    const title = isSession ? "My Net Sniper session" : "My Net Sniper career stats";
+    const message =
+      `${title}\n` +
+      `Shots: ${src.totalShots}\n` +
+      `On Target: ${src.onTarget}\n` +
+      `Missed: ${src.missed}\n` +
+      `Accuracy: ${pct(src.onTarget, src.totalShots)}%` +
+      (isSession ? `\nTime: ${fmtMMSS(src.duration)}` : "");
+    try {
+      await Share.share({ message });
+    } catch {
+      // Sharing can be cancelled by the user - nothing to do.
+    }
   }
 
   const onSetupTap = useCallback((evt) => {
@@ -429,13 +497,23 @@ export default function App() {
       setNetBox((nb) => ({ ...nb, x2: x, y2: y }));
       setSetupStage("targets");
     } else {
-      setTargets((ts) => [...ts, { x, y }]);
+      setTargets((ts) => [...ts, { x, y, radius: targetRadius }]);
+      setSelectedTargetIndex(null);
     }
-  }, [layout.h, layout.w, setupStage]);
+  }, [layout.h, layout.w, setupStage, targetRadius]);
+
+  const onDragTarget = useCallback((index, nx, ny) => {
+    setTargets((ts) => ts.map((t, i) => (i === index ? { ...t, x: nx, y: ny } : t)));
+  }, []);
+
+  const onSelectTarget = useCallback((index) => {
+    setSelectedTargetIndex(index);
+  }, []);
 
   function undoSetup() {
     if (setupStage === "targets" && targets.length > 0) {
       setTargets((ts) => ts.slice(0, -1));
+      setSelectedTargetIndex(null);
       return;
     }
     if (setupStage === "targets") {
@@ -510,6 +588,22 @@ export default function App() {
     };
     const newLog = [...sessionsLog, rec].slice(-100);
 
+    // Streak: a day only counts if this session (or another one that day) had
+    // at least 5 shots before local midnight. Missing a day resets it to 0.
+    let newStreak = streak;
+    if (rec.totalShots >= 5) {
+      const now = new Date();
+      const today = dateKeyFor(now);
+      if (streak.lastDate === today) {
+        newStreak = streak;
+      } else if (isConsecutiveDay(streak.lastDate, now)) {
+        newStreak = { count: (streak.count || 0) + 1, lastDate: today };
+      } else {
+        newStreak = { count: 1, lastDate: today };
+      }
+      setStreak(newStreak);
+    }
+
     setTotals(newTotals);
     setLatest(rec);
     setSessionsLog(newLog);
@@ -519,6 +613,7 @@ export default function App() {
       AsyncStorage.setItem(K_TOTALS, JSON.stringify(newTotals)),
       AsyncStorage.setItem(K_LATEST, JSON.stringify(rec)),
       AsyncStorage.setItem(K_SESSIONS, JSON.stringify(newLog)),
+      AsyncStorage.setItem(K_STREAK, JSON.stringify(newStreak)),
     ]);
     setScreen("summary");
   }
@@ -533,13 +628,15 @@ export default function App() {
           setTotals({ totalShots: 0, onTarget: 0, missed: 0 });
           setLatest(null);
           setSessionsLog([]);
-          await AsyncStorage.multiRemove([K_TOTALS, K_LATEST, K_SESSIONS]);
+          setStreak({ count: 0, lastDate: null });
+          await AsyncStorage.multiRemove([K_TOTALS, K_LATEST, K_SESSIONS, K_STREAK]);
         },
       },
     ]);
   }
 
   if (screen === "menu") {
+    const displayStreak = computeDisplayStreak(streak, new Date());
     return (
       <SafeAreaView style={s.root}>
         <ExpoStatusBar style="light" />
@@ -547,6 +644,12 @@ export default function App() {
         <ScrollView contentContainerStyle={s.menuPad}>
           <Brand title="Net Sniper" />
           <Text style={s.subtitle}>Track your shooting accuracy, one puck at a time.</Text>
+
+          {displayStreak > 0 ? (
+            <View style={s.streakBanner}>
+              <Text style={s.streakText}>{displayStreak} day streak</Text>
+            </View>
+          ) : null}
 
           <Card title="Latest Session">
             {!latest ? (
@@ -571,15 +674,29 @@ export default function App() {
             </View>
             <Text style={s.careerAccuracy}>{pct(totals.onTarget, totals.totalShots)}%</Text>
             <Text style={s.centerMeta}>Career Accuracy</Text>
+            <Pressable style={s.shareLink} onPress={() => shareStats(null)}>
+              <Text style={s.shareLinkText}>Share Career Stats</Text>
+            </Pressable>
           </Card>
 
           <Pressable style={s.btnPrimary} onPress={enterSetup}>
             <Text style={s.btnPrimaryText}>Start Shooting Session</Text>
           </Pressable>
+          <View style={s.rowBtns}>
+            <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setScreen("sessions")}>
+              <Text style={s.btnSecondaryText}>Session History</Text>
+            </Pressable>
+            <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setScreen("settings")}>
+              <Text style={s.btnSecondaryText}>Settings</Text>
+            </Pressable>
+          </View>
           <Pressable style={s.btnSecondary} onPress={resetAllStats}>
             <Text style={s.btnSecondaryText}>Reset All Stats</Text>
           </Pressable>
         </ScrollView>
+        {showTutorial ? (
+          <TutorialOverlay step={tutorialStep} setStep={setTutorialStep} onDone={dismissTutorial} />
+        ) : null}
       </SafeAreaView>
     );
   }
@@ -623,9 +740,19 @@ export default function App() {
         : setupStage === "netcorner2"
           ? "Step 2: Tap the bottom-right corner of your net opening."
           : targets.length
-            ? `${targets.length} target(s) placed. Tap to add more, or begin session.`
+            ? "Drag targets to move them, tap one to resize it, or tap empty space to add more."
             : "Net area set. Tap inside it to place target zones.";
     const canBegin = setupStage === "targets" && targets.length > 0;
+    const selectedTarget = setupStage === "targets" && selectedTargetIndex != null ? targets[selectedTargetIndex] : null;
+    const sliderValue = selectedTarget ? selectedTarget.radius : targetRadius;
+    const sliderLabel = selectedTarget ? `Target ${selectedTargetIndex + 1} Size` : "New Target Size";
+    const onSliderChange = (v) => {
+      if (selectedTarget) {
+        setTargets((ts) => ts.map((t, i) => (i === selectedTargetIndex ? { ...t, radius: v } : t)));
+      } else {
+        setTargetRadius(v);
+      }
+    };
 
     return (
       <View style={s.cameraRoot}>
@@ -643,8 +770,22 @@ export default function App() {
             isActive={screen === "setup"}
           />
           <Svg style={StyleSheet.absoluteFill}>
-            <NetAndTargets netBox={netBox} targets={targets} w={layout.w} h={layout.h} radius={radiusPx(layout.w)} showLabels />
+            <NetAndTargets netBox={netBox} targets={setupStage === "targets" ? [] : targets} w={layout.w} h={layout.h} showLabels />
           </Svg>
+          {setupStage === "targets"
+            ? targets.map((t, i) => (
+              <DraggableTarget
+                key={`drag-${i}`}
+                target={t}
+                index={i}
+                w={layout.w}
+                h={layout.h}
+                selected={selectedTargetIndex === i}
+                onSelect={onSelectTarget}
+                onDrag={onDragTarget}
+              />
+            ))
+            : null}
 
           <View style={s.topbar}>
             <IconBtn label="<" onPress={() => setScreen("menu")} />
@@ -663,19 +804,35 @@ export default function App() {
             {setupStage === "targets" ? (
               <View style={s.sliderBox}>
                 <View style={s.sliderHeader}>
-                  <Text style={s.sliderLabel}>Target Size</Text>
-                  <Text style={s.sliderValue}>{targetSizeLabel(targetRadius)}</Text>
+                  <Text style={s.sliderLabel}>{sliderLabel}</Text>
+                  <Text style={s.sliderValue}>{targetSizeLabel(sliderValue)}</Text>
                 </View>
                 <Slider
                   minimumValue={7}
                   maximumValue={60}
                   step={1}
-                  value={targetRadius}
+                  value={sliderValue}
                   minimumTrackTintColor={C.amber}
                   maximumTrackTintColor={C.line}
                   thumbTintColor={C.amber}
-                  onValueChange={setTargetRadius}
+                  onValueChange={onSliderChange}
                 />
+                {selectedTarget ? (
+                  <View style={s.rowBtns}>
+                    <Pressable
+                      style={[s.btnSecondary, s.flexOne]}
+                      onPress={() => {
+                        setTargets((ts) => ts.filter((_, i) => i !== selectedTargetIndex));
+                        setSelectedTargetIndex(null);
+                      }}
+                    >
+                      <Text style={s.btnSecondaryText}>Delete Target</Text>
+                    </Pressable>
+                    <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setSelectedTargetIndex(null)}>
+                      <Text style={s.btnSecondaryText}>Done</Text>
+                    </Pressable>
+                  </View>
+                ) : null}
               </View>
             ) : null}
             <View style={s.rowBtns}>
@@ -719,7 +876,6 @@ export default function App() {
               targets={targets}
               w={layout.w}
               h={layout.h}
-              radius={radiusPx(layout.w)}
               flash={flash}
             />
           </Svg>
@@ -811,8 +967,152 @@ export default function App() {
               <Stat n={summaryRec.targetsUsed} l="Targets Used" c={C.ice} />
             </View>
           </Card>
+          <Pressable style={s.btnSecondary} onPress={() => shareStats(summaryRec)}>
+            <Text style={s.btnSecondaryText}>Share This Session</Text>
+          </Pressable>
           <Pressable style={s.btnPrimary} onPress={() => setScreen("menu")}>
             <Text style={s.btnPrimaryText}>Back to Main Menu</Text>
+          </Pressable>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (screen === "sessions") {
+    const rows = [...sessionsLog].reverse();
+    return (
+      <SafeAreaView style={s.root}>
+        <ExpoStatusBar style="light" />
+        <View style={s.topbarStatic}>
+          <IconBtn label="<" onPress={() => setScreen("menu")} />
+          <Text style={s.topbarTitleDark}>Session History</Text>
+          <View style={{ width: 38 }} />
+        </View>
+        <ScrollView contentContainerStyle={s.menuPad}>
+          {rows.length === 0 ? (
+            <Card>
+              <Text style={s.empty}>No sessions yet - take your first shot!</Text>
+            </Card>
+          ) : (
+            rows.map((rec, i) => (
+              <Card key={rec.date || i}>
+                <View style={s.sessionRowHeader}>
+                  <Text style={s.sessionRowDate}>{new Date(rec.date).toLocaleString()}</Text>
+                  <Text style={s.sessionRowAccuracy}>{pct(rec.onTarget, rec.totalShots)}%</Text>
+                </View>
+                <View style={s.statRow}>
+                  <Stat n={rec.totalShots} l="Shots" c={C.amber} />
+                  <Stat n={rec.onTarget} l="On Target" c={C.green} />
+                  <Stat n={rec.missed} l="Missed" c={C.crimson} />
+                </View>
+                <Text style={s.metaLine}>{fmtMMSS(rec.duration)} - {rec.targetsUsed} target(s)</Text>
+                <Pressable style={s.shareLink} onPress={() => shareStats(rec)}>
+                  <Text style={s.shareLinkText}>Share This Session</Text>
+                </Pressable>
+              </Card>
+            ))
+          )}
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (screen === "settings") {
+    return (
+      <SafeAreaView style={s.root}>
+        <ExpoStatusBar style="light" />
+        <View style={s.topbarStatic}>
+          <IconBtn label="<" onPress={() => setScreen("menu")} />
+          <Text style={s.topbarTitleDark}>Detection Settings</Text>
+          <View style={{ width: 38 }} />
+        </View>
+        <ScrollView contentContainerStyle={s.menuPad}>
+          <Text style={s.subtitle}>
+            These control how auto-detect senses the puck. Defaults work well for most setups - only
+            change these if you're fine-tuning for your lighting or camera.
+          </Text>
+          <SettingSlider
+            label="Motion Sensitivity"
+            hint="Lower = more sensitive to small/distant movement"
+            value={settings.motionDiffNoiseMult}
+            min={1.5}
+            max={5}
+            step={0.1}
+            format={(v) => v.toFixed(1)}
+            onChange={(v) => updateSetting("motionDiffNoiseMult", v)}
+          />
+          <SettingSlider
+            label="Minimum Changed Cells"
+            hint="How many grid cells must change to count as motion"
+            value={settings.minChangedSamples}
+            min={1}
+            max={10}
+            step={1}
+            format={(v) => String(Math.round(v))}
+            onChange={(v) => updateSetting("minChangedSamples", Math.round(v))}
+          />
+          <SettingSlider
+            label="Grid Detail"
+            hint="Smaller spacing = finer detection grid (uses more CPU)"
+            value={settings.sampleSpacingPx}
+            min={3}
+            max={12}
+            step={1}
+            format={(v) => `${Math.round(v)}px`}
+            onChange={(v) => updateSetting("sampleSpacingPx", Math.round(v))}
+          />
+          <SettingSlider
+            label="Frames to Confirm Shot Start"
+            hint="Higher = fewer false starts, but slightly slower to react"
+            value={settings.motionOnsetFrames}
+            min={1}
+            max={5}
+            step={1}
+            format={(v) => String(Math.round(v))}
+            onChange={(v) => updateSetting("motionOnsetFrames", Math.round(v))}
+          />
+          <SettingSlider
+            label="Frames to Confirm Shot End"
+            hint="Higher = waits longer for bounces/wobble to settle before counting"
+            value={settings.motionEndQuietFrames}
+            min={1}
+            max={10}
+            step={1}
+            format={(v) => String(Math.round(v))}
+            onChange={(v) => updateSetting("motionEndQuietFrames", Math.round(v))}
+          />
+          <SettingSlider
+            label="Cooldown Between Shots"
+            hint="Minimum time before a new shot can start after one ends"
+            value={settings.shotCooldownMs}
+            min={200}
+            max={3000}
+            step={50}
+            format={(v) => `${Math.round(v)}ms`}
+            onChange={(v) => updateSetting("shotCooldownMs", Math.round(v))}
+          />
+          <SettingSlider
+            label="Hit Zone Generosity"
+            hint="How far past a target's edge still counts as a hit"
+            value={settings.hitRadiusMult}
+            min={1}
+            max={2}
+            step={0.05}
+            format={(v) => `${v.toFixed(2)}x`}
+            onChange={(v) => updateSetting("hitRadiusMult", v)}
+          />
+          <SettingSlider
+            label="Max Changed Ratio"
+            hint="Ignore motion covering more than this % of the net box (shake/lighting)"
+            value={settings.maxChangedRatio * 100}
+            min={20}
+            max={90}
+            step={5}
+            format={(v) => `${Math.round(v)}%`}
+            onChange={(v) => updateSetting("maxChangedRatio", v / 100)}
+          />
+          <Pressable style={s.btnSecondary} onPress={resetSettingsToDefault}>
+            <Text style={s.btnSecondaryText}>Reset to Defaults</Text>
           </Pressable>
         </ScrollView>
       </SafeAreaView>
@@ -877,7 +1177,7 @@ function IconBtn({ label, onPress }) {
   );
 }
 
-function NetAndTargets({ netBox, targets, w, h, radius, showLabels, flash }) {
+function NetAndTargets({ netBox, targets, w, h, showLabels, flash }) {
   return (
     <>
       {netBox && netBox.x2 !== undefined ? (
@@ -897,6 +1197,7 @@ function NetAndTargets({ netBox, targets, w, h, radius, showLabels, flash }) {
       {targets.map((t, i) => {
         const cx = t.x * w;
         const cy = t.y * h;
+        const radius = ((t.radius || DEFAULT_TARGET_RADIUS) / REF_WIDTH) * w;
         return (
           <React.Fragment key={`${t.x}-${t.y}-${i}`}>
             <Circle cx={cx} cy={cy} r={radius} fill="none" stroke={C.amber} strokeWidth={3} opacity={0.9} />
@@ -918,6 +1219,135 @@ function NetAndTargets({ netBox, targets, w, h, radius, showLabels, flash }) {
         />
       ) : null}
     </>
+  );
+}
+
+function DraggableTarget({ target, index, w, h, selected, onSelect, onDrag }) {
+  const stateRef = useRef({ target, index, w, h, onSelect, onDrag });
+  stateRef.current = { target, index, w, h, onSelect, onDrag };
+  const startRef = useRef({ x: 0, y: 0 });
+
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => {
+        const { target: t, w: ww, h: hh, index: idx, onSelect: sel } = stateRef.current;
+        startRef.current = { x: t.x * ww, y: t.y * hh };
+        sel(idx);
+      },
+      onPanResponderMove: (_evt, gesture) => {
+        const { w: ww, h: hh, index: idx, onDrag: drag } = stateRef.current;
+        const nx = Math.max(0, Math.min(1, (startRef.current.x + gesture.dx) / ww));
+        const ny = Math.max(0, Math.min(1, (startRef.current.y + gesture.dy) / hh));
+        drag(idx, nx, ny);
+      },
+    })
+  ).current;
+
+  const radius = ((target.radius || DEFAULT_TARGET_RADIUS) / REF_WIDTH) * w;
+  const size = radius * 2;
+
+  return (
+    <View
+      {...pan.panHandlers}
+      style={[
+        s.dragTarget,
+        {
+          left: target.x * w - radius,
+          top: target.y * h - radius,
+          width: size,
+          height: size,
+          borderRadius: radius,
+          borderColor: selected ? C.cyan : C.amber,
+          backgroundColor: selected ? "rgba(79,182,199,0.15)" : "rgba(226,166,59,0.08)",
+        },
+      ]}
+    >
+      <Text style={s.dragTargetLabel}>{index + 1}</Text>
+    </View>
+  );
+}
+
+function SettingSlider({ label, hint, value, min, max, step, format, onChange }) {
+  return (
+    <Card>
+      <View style={s.sliderHeader}>
+        <Text style={s.settingLabel}>{label}</Text>
+        <Text style={s.sliderValue}>{format(value)}</Text>
+      </View>
+      <Slider
+        minimumValue={min}
+        maximumValue={max}
+        step={step}
+        value={value}
+        minimumTrackTintColor={C.amber}
+        maximumTrackTintColor={C.line}
+        thumbTintColor={C.amber}
+        onValueChange={onChange}
+      />
+      <Text style={s.settingHint}>{hint}</Text>
+    </Card>
+  );
+}
+
+const TUTORIAL_STEPS = [
+  {
+    title: "Welcome to Net Sniper",
+    body: "Track your shooting accuracy using your phone's camera. Here's a quick rundown before your first session.",
+  },
+  {
+    title: "1. Set Up Your Net",
+    body: "Tap the top-left, then bottom-right corner of your net opening to mark the area the camera should watch.",
+  },
+  {
+    title: "2. Place Targets",
+    body: "Tap inside the net to drop target zones. Drag any target to move it, or tap one to resize it individually.",
+  },
+  {
+    title: "3. Shoot",
+    body: "Turn on Auto-Detect and the app will watch for pucks entering the net and score hits automatically. You can also log shots manually with the on-screen buttons.",
+  },
+  {
+    title: "4. Build a Streak",
+    body: "Take at least 5 shots in a session before midnight (your local time) to keep your daily streak alive. Miss a day and it resets.",
+  },
+];
+
+function TutorialOverlay({ step, setStep, onDone }) {
+  const info = TUTORIAL_STEPS[step];
+  const isLast = step === TUTORIAL_STEPS.length - 1;
+  return (
+    <Modal transparent animationType="fade" visible>
+      <View style={s.tutorialBackdrop}>
+        <View style={s.tutorialCard}>
+          <Text style={s.tutorialTitle}>{info.title}</Text>
+          <Text style={s.tutorialBody}>{info.body}</Text>
+          <View style={s.tutorialDots}>
+            {TUTORIAL_STEPS.map((_, i) => (
+              <View key={i} style={[s.tutorialDot, i === step && s.tutorialDotActive]} />
+            ))}
+          </View>
+          <View style={s.rowBtns}>
+            {step > 0 ? (
+              <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setStep((v) => v - 1)}>
+                <Text style={s.btnSecondaryText}>Back</Text>
+              </Pressable>
+            ) : (
+              <Pressable style={[s.btnSecondary, s.flexOne]} onPress={onDone}>
+                <Text style={s.btnSecondaryText}>Skip</Text>
+              </Pressable>
+            )}
+            <Pressable
+              style={[s.btnPrimary, s.flexOne]}
+              onPress={() => (isLast ? onDone() : setStep((v) => v + 1))}
+            >
+              <Text style={s.btnPrimaryText}>{isLast ? "Got It" : "Next"}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -1009,4 +1439,47 @@ const s = StyleSheet.create({
   pausedCopy: { color: C.steel, fontSize: 14, textAlign: "center" },
   summaryHero: { alignItems: "center", paddingVertical: 4 },
   summaryAccuracy: { color: C.amber, fontSize: 50, fontWeight: "700" },
+  streakBanner: { backgroundColor: "rgba(226,166,59,0.14)", borderColor: "rgba(226,166,59,0.4)", borderWidth: 1, borderRadius: 12, paddingVertical: 10, alignItems: "center" },
+  streakText: { color: C.amber, fontWeight: "700", fontSize: 14, textTransform: "uppercase", letterSpacing: 0.5 },
+  shareLink: { marginTop: 14, alignItems: "center", paddingVertical: 6 },
+  shareLinkText: { color: C.cyan, fontWeight: "700", fontSize: 12.5, textTransform: "uppercase", letterSpacing: 0.5 },
+  topbarStatic: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: C.line,
+  },
+  topbarTitleDark: { color: C.ice, fontSize: 17, fontWeight: "700", flex: 1, textAlign: "center", textTransform: "uppercase" },
+  sessionRowHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
+  sessionRowDate: { color: C.steel, fontSize: 12 },
+  sessionRowAccuracy: { color: C.amber, fontSize: 16, fontWeight: "700" },
+  dragTarget: {
+    position: "absolute",
+    borderWidth: 3,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dragTargetLabel: { color: C.ice, fontWeight: "700", fontSize: 13 },
+  settingLabel: { color: C.ice, fontSize: 13, fontWeight: "700", flex: 1, paddingRight: 8 },
+  settingHint: { color: C.steel, fontSize: 11, marginTop: 8 },
+  tutorialBackdrop: { flex: 1, backgroundColor: "rgba(6,10,15,0.82)", alignItems: "center", justifyContent: "center", padding: 24 },
+  tutorialCard: {
+    width: "100%",
+    maxWidth: 420,
+    backgroundColor: C.slate2,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: C.line,
+    padding: 22,
+    gap: 14,
+  },
+  tutorialTitle: { color: C.amber, fontSize: 20, fontWeight: "700" },
+  tutorialBody: { color: C.ice, fontSize: 14.5, lineHeight: 21 },
+  tutorialDots: { flexDirection: "row", justifyContent: "center", gap: 6 },
+  tutorialDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: C.line },
+  tutorialDotActive: { backgroundColor: C.amber },
 });
