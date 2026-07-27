@@ -18,7 +18,8 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.netsniper.app",
       "infoPlist": {
-        "NSCameraUsageDescription": "Net Sniper needs camera access to show the net and track shots."
+        "NSCameraUsageDescription": "Net Sniper needs camera access to show the net and track shots.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
