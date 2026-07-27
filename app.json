@@ -37,7 +37,16 @@
         "react-native-vision-camera",
         {
           "cameraPermissionText": "Net Sniper needs camera access to show the net and track shots.",
-          "enableMicrophonePermission": false
+          "enableMicrophonePermission": false,
+          "enableFrameProcessors": true
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
         }
       ]
     ],
