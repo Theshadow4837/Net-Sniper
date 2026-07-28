@@ -229,7 +229,12 @@ export default function App() {
     if (isPaused) return;
     // Ignore shots while a game is armed/counting down - it hasn't started yet.
     if (gameMode && !(gameLive && gameLive.phase === "live")) return;
-    const hit = hitIndex >= 0;
+    // In Called Shot, only hitting the exact called-out target counts as a
+    // hit - hitting a different target, or missing outright, both count as
+    // a miss for stats purposes (they just don't end the round).
+    const hit = gameMode === "calledShot"
+      ? (gameLive != null && hitIndex === gameLive.calledIndex)
+      : hitIndex >= 0;
     setCurrent((cur) => {
       if (!cur) return cur;
       return {
@@ -272,16 +277,21 @@ export default function App() {
     if (gameMode === "calledShot") {
       setGameLive((g) => {
         if (!g || g.ended) return g;
-        if (hitIndex === g.calledIndex) {
+        if (hit) {
           const nextLimit = Math.max(CALLED_SHOT_MIN_MS, g.roundLimitMs - CALLED_SHOT_STEP_MS);
           const roundsCompleted = g.roundsCompleted + 1;
           if (gameTimerRef.current) clearInterval(gameTimerRef.current);
-          setTimeout(() => startCalledShotRound(nextLimit, roundsCompleted), 300);
+          try {
+            Speech.speak("Good", { rate: 1.15 });
+          } catch {
+            // Speech is best-effort.
+          }
+          setTimeout(() => startCalledShotRound(nextLimit, roundsCompleted), 900);
           return { ...g, roundsCompleted, roundLimitMs: nextLimit, awaitingNext: true };
         }
         // Wrong target (or a miss) doesn't end the round - only the round
         // timer running out does. This keeps the game readable: you always
-        // know exactly why a round ended.
+        // know exactly why a round ended. It still counted as a miss above.
         return g;
       });
       return;
