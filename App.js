@@ -20,18 +20,32 @@ import { Worklets } from "react-native-worklets-core";
 import { Camera, useCameraDevices, useCameraPermission, useFrameProcessor } from "react-native-vision-camera";
 import { runAtTargetFps } from "react-native-vision-camera";
 import * as Speech from "expo-speech";
+// Voice command support ("start" / "pause" / "resume"). This is a native
+// module - after pulling this change, run `npx expo install
+// @react-native-voice/voice` and rebuild your dev client (expo run:android /
+// expo run:ios / eas build) or voice commands will silently no-op.
+let Voice = null;
+try {
+  // eslint-disable-next-line global-require
+  Voice = require("@react-native-voice/voice").default;
+} catch {
+  Voice = null;
+}
 
 const C = {
   arena: "#0A121C",
   slate: "#121F2C",
   slate2: "#182838",
+  slate3: "#1F3140",
   ice: "#E9F2F6",
   steel: "#7E93A6",
   line: "#223243",
   amber: "#E2A63B",
+  amberDeep: "#B9822A",
   cyan: "#4FB6C7",
   green: "#4CAE7C",
   crimson: "#D1495B",
+  violet: "#8C7CF0",
 };
 
 const K_TOTALS = "netsniper:totals";
@@ -62,15 +76,18 @@ const MAX_GRID_COLS = 64;
 const MAX_GRID_ROWS = 48;
 const DEFAULT_TARGET_RADIUS = 34;
 const TIME_ATTACK_DURATIONS = [15, 30, 60, 90];
-const CALLED_SHOT_START_MS = 4000;
-const CALLED_SHOT_MIN_MS = 1200;
-const CALLED_SHOT_STEP_MS = 200;
+// Called Shot: a LOT of time on the very first calls, ramping down steadily
+// as rounds are completed, down to a tight minimum.
+const CALLED_SHOT_START_MS = 20000;
+const CALLED_SHOT_MIN_MS = 1000;
+const CALLED_SHOT_STEP_MS = 650;
 const GAME_INFO = {
   timeAttack: { title: "Time Attack", blurb: "Pick a clock and rack up as many On Target hits as you can before it runs out." },
   suddenDeath: { title: "Sudden Death", blurb: "Your streak climbs with every hit. One missed shot ends the run." },
   perfect10: { title: "Perfect 10", blurb: "10 shots, one accuracy %. Try to beat your personal best." },
-  calledShot: { title: "Called Shot", blurb: "A number is called out - hit that exact target before time runs out. Gets faster each round." },
+  calledShot: { title: "Called Shot", blurb: "A number is called out - hit that exact target before time runs out. Starts slow, gets much faster." },
 };
+const SCREENS_WITH_NAV = ["menu", "games", "sessions", "settings", "highscores"];
 
 function pct(on, total) {
   return total ? Math.round((on / total) * 100) : 0;
@@ -146,7 +163,11 @@ export default function App() {
 
   const timerRef = useRef(null);
   const gameTimerRef = useRef(null);
+  const countdownRef = useRef(null);
   const pauseStartRef = useRef(0);
+  const gameModeRef = useRef(null);
+  const timeAttackDurationRef = useRef(timeAttackDuration);
+  timeAttackDurationRef.current = timeAttackDuration;
 
   const { hasPermission, requestPermission } = useCameraPermission();
   const hookDevices = useCameraDevices();
@@ -170,14 +191,21 @@ export default function App() {
   }, [device]);
   const maxFps = format?.maxFps ? Math.round(format.maxFps) : null;
 
-  function startCalledShotRound(limitMs, roundsCompleted) {
+  // True once a game is actually live (post-countdown) - or always true for
+  // a plain shooting session. Used to keep auto-detect from scoring shots
+  // while a game is still "armed" and waiting for the start command.
+  const gameIsScoring = !gameMode || (gameLive && gameLive.phase === "live");
+
+  function startCalledShotRound(limitMs, roundsCompleted, announce = true) {
     setGameLive((g) => {
       if (!g || targets.length === 0) return g;
-      const idx = Math.floor(Math.random() * targets.length);
-      try {
-        Speech.speak(String(idx + 1), { rate: 1.0 });
-      } catch {
-        // Speech is best-effort - the huge on-screen number is the fallback.
+      const idx = announce || g.calledIndex == null ? Math.floor(Math.random() * targets.length) : g.calledIndex;
+      if (announce) {
+        try {
+          Speech.speak(String(idx + 1), { rate: 1.0 });
+        } catch {
+          // Speech is best-effort - the huge on-screen number is the fallback.
+        }
       }
       if (gameTimerRef.current) clearInterval(gameTimerRef.current);
       const endAt = Date.now() + limitMs;
@@ -193,12 +221,14 @@ export default function App() {
           return { ...cur, roundRemainingMs: remain };
         });
       }, 100);
-      return { ...g, calledIndex: idx, roundLimitMs: limitMs, roundRemainingMs: limitMs, roundsCompleted, awaitingNext: false };
+      return { ...g, calledIndex: idx, roundLimitMs: limitMs, roundRemainingMs: limitMs, roundsCompleted, awaitingNext: false, phase: "live" };
     });
   }
 
   const handleShotResult = useCallback((hitIndex) => {
     if (isPaused) return;
+    // Ignore shots while a game is armed/counting down - it hasn't started yet.
+    if (gameMode && !(gameLive && gameLive.phase === "live")) return;
     const hit = hitIndex >= 0;
     setCurrent((cur) => {
       if (!cur) return cur;
@@ -257,7 +287,7 @@ export default function App() {
       return;
     }
     // Time Attack needs no extra branching - the countdown timer ends it.
-  }, [isPaused, gameMode, autoDetectOn, targets.length]);
+  }, [isPaused, gameMode, gameLive, autoDetectOn, targets.length]);
 
   const onFrameShot = useMemo(() => Worklets.createRunOnJS((hitIndex) => {
     handleShotResult(hitIndex);
@@ -273,7 +303,7 @@ export default function App() {
     const cfg = settings;
     runAtTargetFps(targetFps, () => {
       "worklet";
-      if (!autoDetectOn || isPaused || !netBox || netBox.x2 === undefined || targets.length === 0) {
+      if (!autoDetectOn || isPaused || !gameIsScoring || !netBox || netBox.x2 === undefined || targets.length === 0) {
         global.__netSniperPrevSamples = undefined;
         global.__netSniperPrevCols = undefined;
         global.__netSniperPrevRows = undefined;
@@ -473,7 +503,7 @@ export default function App() {
       }
       global.__netSniperPrevCentroid = { x: cx, y: cy };
     });
-  }, [autoDetectOn, isPaused, netBox, targets, settings, maxFps, onFrameShot]);
+  }, [autoDetectOn, isPaused, gameIsScoring, netBox, targets, settings, maxFps, onFrameShot]);
 
   useEffect(() => {
     if (!hasPermission) {
@@ -528,7 +558,69 @@ export default function App() {
   useEffect(() => () => {
     if (timerRef.current) clearInterval(timerRef.current);
     if (gameTimerRef.current) clearInterval(gameTimerRef.current);
+    if (countdownRef.current) clearInterval(countdownRef.current);
   }, []);
+
+  // ---- Voice commands ("start" while a game is armed, "pause"/"resume" any
+  // time a session or game is running). Best-effort: if the native module
+  // isn't installed/built, this whole block just never fires.
+  const voiceListeningRef = useRef(false);
+  const handleVoiceCommandRef = useRef(() => {});
+
+  useEffect(() => {
+    handleVoiceCommandRef.current = (rawText) => {
+      const t = (rawText || "").toLowerCase();
+      if (screen === "game" && gameLive?.phase === "armed" && /\bstart\b/.test(t)) {
+        startCountdown();
+        return;
+      }
+      if ((screen === "game" || screen === "session") && /\bpause\b/.test(t) && !isPaused) {
+        if (screen === "session") pauseSession();
+        else pauseGame();
+        return;
+      }
+      if ((screen === "game" || screen === "session") && /\b(resume|unpause|continue)\b/.test(t) && isPaused) {
+        if (screen === "session") resumeSession();
+        else resumeGame();
+      }
+    };
+  });
+
+  useEffect(() => {
+    if (!Voice) return undefined;
+    const shouldListen = screen === "game" || screen === "session";
+    if (!shouldListen) {
+      if (voiceListeningRef.current) {
+        voiceListeningRef.current = false;
+        Voice.stop().catch(() => {});
+      }
+      return undefined;
+    }
+
+    const restart = () => {
+      if (!voiceListeningRef.current) return;
+      Voice.start("en-US").catch(() => {});
+    };
+    Voice.onSpeechResults = (e) => {
+      const text = (e && e.value && e.value.join(" ")) || "";
+      handleVoiceCommandRef.current(text);
+    };
+    Voice.onSpeechPartialResults = (e) => {
+      const text = (e && e.value && e.value.join(" ")) || "";
+      handleVoiceCommandRef.current(text);
+    };
+    Voice.onSpeechEnd = () => setTimeout(restart, 150);
+    Voice.onSpeechError = () => setTimeout(restart, 400);
+
+    voiceListeningRef.current = true;
+    Voice.start("en-US").catch(() => {});
+
+    return () => {
+      voiceListeningRef.current = false;
+      Voice.stop().catch(() => {});
+      Voice.destroy().then(() => Voice.removeAllListeners()).catch(() => {});
+    };
+  }, [screen]);
 
   const radiusPx = useCallback((r, width) => (r / REF_WIDTH) * width, []);
 
@@ -631,7 +723,7 @@ export default function App() {
     if (pendingGameMode) {
       const mode = pendingGameMode;
       setPendingGameMode(null);
-      launchGame(mode);
+      armGame(mode);
       return;
     }
     const next = { totalShots: 0, onTarget: 0, missed: 0, startTime: Date.now(), pausedAccum: 0 };
@@ -676,6 +768,48 @@ export default function App() {
     setCurrent((cur) => (cur ? { ...cur, pausedAccum: cur.pausedAccum + Date.now() - pauseStartRef.current } : cur));
     setIsPaused(false);
     setAutoStatusText(autoDetectOn ? "Watching" : "Manual Mode");
+  }
+
+  // Games have their own pause/resume because the underlying countdown
+  // timers (Time Attack clock, Called Shot round clock) need to be stopped
+  // and restarted around the pause instead of just freezing the UI.
+  function pauseGame() {
+    if (isPaused || !current) return;
+    setIsPaused(true);
+    setAutoStatusText("Paused");
+    pauseStartRef.current = Date.now();
+    if (gameTimerRef.current) clearInterval(gameTimerRef.current);
+  }
+
+  function resumeGame() {
+    if (!isPaused || !current) return;
+    setIsPaused(false);
+    setAutoStatusText(autoDetectOn ? "Watching" : "Manual Mode");
+    setCurrent((cur) => (cur ? { ...cur, pausedAccum: cur.pausedAccum + Date.now() - pauseStartRef.current } : cur));
+
+    if (gameMode === "timeAttack") {
+      setGameLive((g) => {
+        if (!g) return g;
+        const endAt = Date.now() + g.remainingMs;
+        gameTimerRef.current = setInterval(() => {
+          const remain = endAt - Date.now();
+          if (remain <= 0) {
+            clearInterval(gameTimerRef.current);
+            setGameLive((gg) => (gg ? { ...gg, remainingMs: 0 } : gg));
+            setPendingGameEnd({ reason: "time" });
+          } else {
+            setGameLive((gg) => (gg ? { ...gg, remainingMs: remain } : gg));
+          }
+        }, 100);
+        return g;
+      });
+    } else if (gameMode === "calledShot") {
+      setGameLive((g) => {
+        if (!g) return g;
+        startCalledShotRound(g.roundRemainingMs, g.roundsCompleted, false);
+        return g;
+      });
+    }
   }
 
   async function finishSession() {
@@ -738,24 +872,53 @@ export default function App() {
           setLatest(null);
           setSessionsLog([]);
           setStreak({ count: 0, lastDate: null });
-          await AsyncStorage.multiRemove([K_TOTALS, K_LATEST, K_SESSIONS, K_STREAK]);
+          setBestPerfect10(0);
+          await AsyncStorage.multiRemove([K_TOTALS, K_LATEST, K_SESSIONS, K_STREAK, K_BEST_PERFECT10]);
         },
       },
     ]);
   }
 
+  // Every game (and every session) requires a fresh net/target setup - we
+  // never silently reuse whatever was placed for a previous round.
   function startGameFlow(mode) {
-    if (targets.length === 0) {
-      setPendingGameMode(mode);
-      resetSetup();
-      setScreen("setup");
-    } else {
-      launchGame(mode);
-    }
+    setPendingGameMode(mode);
+    resetSetup();
+    setScreen("setup");
   }
 
-  function launchGame(mode) {
-    if (mode === "timeAttack") startTimeAttack(timeAttackDuration);
+  // "Arm" a game: net/targets are already placed, auto-detect defaults ON,
+  // but nothing is scored and no clock runs until the player says or taps
+  // "Start", at which point a 3-2-1 countdown runs and the real game begins.
+  function armGame(mode) {
+    gameModeRef.current = mode;
+    setGameMode(mode);
+    setCurrent(null);
+    setIsPaused(false);
+    setAutoDetectOn(true);
+    setAutoStatusText("Watching");
+    setGameLive({ phase: "armed" });
+    setScreen("game");
+  }
+
+  function startCountdown() {
+    setGameLive((g) => (g && g.phase === "armed" ? { ...g, phase: "countdown", count: 3 } : g));
+    let n = 3;
+    if (countdownRef.current) clearInterval(countdownRef.current);
+    countdownRef.current = setInterval(() => {
+      n -= 1;
+      if (n <= 0) {
+        clearInterval(countdownRef.current);
+        activateGameMode();
+      } else {
+        setGameLive((g) => (g ? { ...g, count: n } : g));
+      }
+    }, 800);
+  }
+
+  function activateGameMode() {
+    const mode = gameModeRef.current;
+    if (mode === "timeAttack") startTimeAttack(timeAttackDurationRef.current);
     else if (mode === "suddenDeath") startSuddenDeath();
     else if (mode === "perfect10") startPerfect10();
     else if (mode === "calledShot") startCalledShot();
@@ -765,11 +928,7 @@ export default function App() {
     const next = { totalShots: 0, onTarget: 0, missed: 0, startTime: Date.now(), pausedAccum: 0 };
     setCurrent(next);
     setIsPaused(false);
-    setAutoDetectOn(false);
-    setAutoStatusText("Manual Mode");
-    setGameMode(mode);
-    setGameLive(live);
-    setScreen("game");
+    setGameLive({ ...live, phase: "live" });
   }
 
   function startTimeAttack(durationSec) {
@@ -883,9 +1042,30 @@ export default function App() {
     setScreen("gameSummary");
   }
 
+  const highScores = useMemo(() => {
+    const best = { timeAttack: 0, suddenDeath: 0, perfect10: bestPerfect10, calledShot: 0 };
+    for (const rec of sessionsLog) {
+      if (!rec.gameMode) continue;
+      const score = rec.gameScore ?? 0;
+      if (score > (best[rec.gameMode] ?? 0)) best[rec.gameMode] = score;
+    }
+    return best;
+  }, [sessionsLog, bestPerfect10]);
+
+  function goTab(target) {
+    setScreen(target);
+  }
+
+  const withNav = (content) => (
+    <>
+      {content}
+      <BottomNav active={screen} onNavigate={goTab} />
+    </>
+  );
+
   if (screen === "menu") {
     const displayStreak = computeDisplayStreak(streak, new Date());
-    return (
+    return withNav(
       <SafeAreaView style={s.root}>
         <ExpoStatusBar style="light" />
         <StatusBar barStyle="light-content" />
@@ -932,17 +1112,6 @@ export default function App() {
           </Pressable>
           <Pressable style={s.btnPrimary} onPress={() => setScreen("games")}>
             <Text style={s.btnPrimaryText}>Play a Game</Text>
-          </Pressable>
-          <View style={s.rowBtns}>
-            <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setScreen("sessions")}>
-              <Text style={s.btnSecondaryText}>Session History</Text>
-            </Pressable>
-            <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setScreen("settings")}>
-              <Text style={s.btnSecondaryText}>Settings</Text>
-            </Pressable>
-          </View>
-          <Pressable style={s.btnSecondary} onPress={resetAllStats}>
-            <Text style={s.btnSecondaryText}>Reset All Stats</Text>
           </Pressable>
         </ScrollView>
         {showTutorial ? (
@@ -1095,7 +1264,7 @@ export default function App() {
                 disabled={!canBegin}
                 onPress={beginSession}
               >
-                <Text style={s.btnPrimaryText}>{pendingGameMode ? "Start Game" : "Begin Session"}</Text>
+                <Text style={s.btnPrimaryText}>{pendingGameMode ? "Continue to Game" : "Begin Session"}</Text>
               </Pressable>
             </View>
           </View>
@@ -1182,7 +1351,7 @@ export default function App() {
           {isPaused ? (
             <View style={s.pausedBanner}>
               <Text style={s.pausedTitle}>Paused</Text>
-              <Text style={s.pausedCopy}>Timer and camera view are stopped.</Text>
+              <Text style={s.pausedCopy}>Timer and camera view are stopped. Say "resume" or tap below.</Text>
               <Pressable style={s.btnPrimaryWide} onPress={resumeSession}>
                 <Text style={s.btnPrimaryText}>Resume Session</Text>
               </Pressable>
@@ -1231,13 +1400,11 @@ export default function App() {
 
   if (screen === "sessions") {
     const rows = [...sessionsLog].reverse();
-    return (
+    return withNav(
       <SafeAreaView style={s.root}>
         <ExpoStatusBar style="light" />
         <View style={s.topbarStatic}>
-          <IconBtn label="<" onPress={() => setScreen("menu")} />
           <Text style={s.topbarTitleDark}>Session History</Text>
-          <View style={{ width: 38 }} />
         </View>
         <ScrollView contentContainerStyle={s.menuPad}>
           {rows.length === 0 ? (
@@ -1251,6 +1418,7 @@ export default function App() {
                   <Text style={s.sessionRowDate}>{new Date(rec.date).toLocaleString()}</Text>
                   <Text style={s.sessionRowAccuracy}>{pct(rec.onTarget, rec.totalShots)}%</Text>
                 </View>
+                {rec.gameMode ? <Text style={s.metaTag}>{GAME_INFO[rec.gameMode]?.title || rec.gameMode}</Text> : null}
                 <View style={s.statRow}>
                   <Stat n={rec.totalShots} l="Shots" c={C.amber} />
                   <Stat n={rec.onTarget} l="On Target" c={C.green} />
@@ -1269,15 +1437,14 @@ export default function App() {
   }
 
   if (screen === "settings") {
-    return (
+    return withNav(
       <SafeAreaView style={s.root}>
         <ExpoStatusBar style="light" />
         <View style={s.topbarStatic}>
-          <IconBtn label="<" onPress={() => setScreen("menu")} />
-          <Text style={s.topbarTitleDark}>Detection Settings</Text>
-          <View style={{ width: 38 }} />
+          <Text style={s.topbarTitleDark}>Settings</Text>
         </View>
         <ScrollView contentContainerStyle={s.menuPad}>
+          <Text style={s.sectionLabel}>Detection Tuning</Text>
           <Text style={s.subtitle}>
             These control how auto-detect senses the puck. Defaults work well for most setups - only
             change these if you're fine-tuning for your lighting or camera.
@@ -1363,7 +1530,12 @@ export default function App() {
             onChange={(v) => updateSetting("maxChangedRatio", v / 100)}
           />
           <Pressable style={s.btnSecondary} onPress={resetSettingsToDefault}>
-            <Text style={s.btnSecondaryText}>Reset to Defaults</Text>
+            <Text style={s.btnSecondaryText}>Reset Detection Settings</Text>
+          </Pressable>
+
+          <Text style={[s.sectionLabel, { marginTop: 8 }]}>Data</Text>
+          <Pressable style={s.btnDanger} onPress={resetAllStats}>
+            <Text style={s.btnDangerText}>Reset All Stats</Text>
           </Pressable>
         </ScrollView>
       </SafeAreaView>
@@ -1371,20 +1543,21 @@ export default function App() {
   }
 
   if (screen === "games") {
-    return (
+    return withNav(
       <SafeAreaView style={s.root}>
         <ExpoStatusBar style="light" />
         <View style={s.topbarStatic}>
-          <IconBtn label="<" onPress={() => setScreen("menu")} />
           <Text style={s.topbarTitleDark}>Games</Text>
-          <View style={{ width: 38 }} />
         </View>
         <ScrollView contentContainerStyle={s.menuPad}>
           <Text style={s.subtitle}>
-            {targets.length === 0
-              ? "No targets placed yet - picking a game will walk you through a quick setup first."
-              : `Using your current setup - ${targets.length} target(s) placed.`}
+            Picking a game always walks you through a fresh net &amp; target setup first, so your
+            targets are exactly where you want them each time.
           </Text>
+
+          <Pressable style={s.btnSecondary} onPress={() => setScreen("highscores")}>
+            <Text style={s.btnSecondaryText}>View High Scores</Text>
+          </Pressable>
 
           <Card title={GAME_INFO.timeAttack.title}>
             <Text style={s.gameBlurb}>{GAME_INFO.timeAttack.blurb}</Text>
@@ -1399,6 +1572,7 @@ export default function App() {
                 </Pressable>
               ))}
             </View>
+            {highScores.timeAttack > 0 ? <Text style={s.metaLine}>Best: {highScores.timeAttack} on target</Text> : null}
             <Pressable style={s.btnPrimary} onPress={() => startGameFlow("timeAttack")}>
               <Text style={s.btnPrimaryText}>Play Time Attack</Text>
             </Pressable>
@@ -1406,6 +1580,7 @@ export default function App() {
 
           <Card title={GAME_INFO.suddenDeath.title}>
             <Text style={s.gameBlurb}>{GAME_INFO.suddenDeath.blurb}</Text>
+            {highScores.suddenDeath > 0 ? <Text style={s.metaLine}>Best streak: {highScores.suddenDeath}</Text> : null}
             <Pressable style={s.btnPrimary} onPress={() => startGameFlow("suddenDeath")}>
               <Text style={s.btnPrimaryText}>Play Sudden Death</Text>
             </Pressable>
@@ -1421,6 +1596,7 @@ export default function App() {
 
           <Card title={GAME_INFO.calledShot.title}>
             <Text style={s.gameBlurb}>{GAME_INFO.calledShot.blurb}</Text>
+            {highScores.calledShot > 0 ? <Text style={s.metaLine}>Best: {highScores.calledShot} rounds</Text> : null}
             <Pressable style={s.btnPrimary} onPress={() => startGameFlow("calledShot")}>
               <Text style={s.btnPrimaryText}>Play Called Shot</Text>
             </Pressable>
@@ -1430,8 +1606,40 @@ export default function App() {
     );
   }
 
+  if (screen === "highscores") {
+    const rows = [
+      { key: "timeAttack", label: "On Target Hits" },
+      { key: "suddenDeath", label: "Longest Streak" },
+      { key: "perfect10", label: "Best Accuracy" },
+      { key: "calledShot", label: "Rounds Completed" },
+    ];
+    return withNav(
+      <SafeAreaView style={s.root}>
+        <ExpoStatusBar style="light" />
+        <View style={s.topbarStatic}>
+          <IconBtn label="<" onPress={() => setScreen("games")} />
+          <Text style={s.topbarTitleDark}>High Scores</Text>
+          <View style={{ width: 38 }} />
+        </View>
+        <ScrollView contentContainerStyle={s.menuPad}>
+          {rows.map((r) => (
+            <Card key={r.key} title={GAME_INFO[r.key].title}>
+              <View style={s.summaryHero}>
+                <Text style={s.summaryAccuracyMed}>
+                  {highScores[r.key]}{r.key === "perfect10" ? "%" : ""}
+                </Text>
+                <Text style={s.centerMeta}>{r.label}</Text>
+              </View>
+            </Card>
+          ))}
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
   if (screen === "game" && device && hasPermission) {
     const live = gameLive || {};
+    const phase = live.phase || "armed";
     return (
       <View style={s.cameraRoot}>
         <ExpoStatusBar style="light" />
@@ -1444,7 +1652,7 @@ export default function App() {
             device={device}
             format={format}
             fps={maxFps || undefined}
-            isActive={screen === "game"}
+            isActive={screen === "game" && !isPaused}
             pixelFormat="yuv"
             frameProcessor={autoDetectOn ? frameProcessor : undefined}
           />
@@ -1457,7 +1665,7 @@ export default function App() {
             <Text style={[s.autoStatus, autoDetectOn ? s.autoOn : s.autoOff]}>{autoStatusText}</Text>
           </View>
 
-          {gameMode === "timeAttack" ? (
+          {phase === "live" && gameMode === "timeAttack" ? (
             <View style={s.hudStats}>
               <Pill n={fmtMMSS(Math.ceil((live.remainingMs || 0) / 1000))} l="Time Left" c={C.cyan} />
               <Pill n={current?.onTarget ?? 0} l="On Target" c={C.green} />
@@ -1465,28 +1673,28 @@ export default function App() {
             </View>
           ) : null}
 
-          {gameMode === "suddenDeath" ? (
+          {phase === "live" && gameMode === "suddenDeath" ? (
             <View style={s.hudStats}>
               <Pill n={live.streak ?? 0} l="Streak" c={C.amber} />
               <Pill n={current?.totalShots ?? 0} l="Shots" c={C.ice} />
             </View>
           ) : null}
 
-          {gameMode === "perfect10" ? (
+          {phase === "live" && gameMode === "perfect10" ? (
             <View style={s.hudStats}>
               <Pill n={`${live.shots ?? 0}/10`} l="Shots" c={C.ice} />
               <Pill n={`${pct(current?.onTarget ?? 0, current?.totalShots ?? 0)}%`} l="Accuracy" c={C.amber} />
             </View>
           ) : null}
 
-          {gameMode === "calledShot" ? (
+          {phase === "live" && gameMode === "calledShot" ? (
             <View style={s.hudStats}>
               <Pill n={live.roundsCompleted ?? 0} l="Rounds" c={C.amber} />
               <Pill n={`${(((live.roundLimitMs ?? CALLED_SHOT_START_MS)) / 1000).toFixed(1)}s`} l="Round Limit" c={C.cyan} />
             </View>
           ) : null}
 
-          {gameMode === "calledShot" && live.calledIndex != null ? (
+          {phase === "live" && gameMode === "calledShot" && live.calledIndex != null ? (
             <View style={s.calledShotOverlay} pointerEvents="none">
               <Text style={s.calledShotBig}>{live.calledIndex + 1}</Text>
               <View style={s.calledShotBarTrack}>
@@ -1497,6 +1705,22 @@ export default function App() {
                   ]}
                 />
               </View>
+            </View>
+          ) : null}
+
+          {(phase === "armed" || phase === "countdown") ? (
+            <View style={s.armedOverlay} pointerEvents="box-none">
+              {phase === "armed" ? (
+                <>
+                  <Text style={s.armedTitle}>Ready when you are</Text>
+                  <Text style={s.armedCopy}>Auto-detect is watching the net. Say "start" or tap below to begin.</Text>
+                  <Pressable style={s.startBtn} onPress={startCountdown}>
+                    <Text style={s.startBtnText}>Start</Text>
+                  </Pressable>
+                </>
+              ) : (
+                <Text style={s.countdownBig}>{live.count}</Text>
+              )}
             </View>
           ) : null}
 
@@ -1519,32 +1743,51 @@ export default function App() {
               </Pressable>
             </View>
 
-            {gameMode === "calledShot" ? (
-              <View style={s.calledShotBtnGrid}>
-                {targets.map((t, i) => (
-                  <Pressable key={i} style={s.calledShotNumBtn} onPress={() => registerCalledShotTarget(i)}>
-                    <Text style={s.calledShotNumBtnText}>{i + 1}</Text>
+            {phase === "live" ? (
+              gameMode === "calledShot" ? (
+                <View style={s.calledShotBtnGrid}>
+                  {targets.map((t, i) => (
+                    <Pressable key={i} style={s.calledShotNumBtn} onPress={() => registerCalledShotTarget(i)}>
+                      <Text style={s.calledShotNumBtnText}>{i + 1}</Text>
+                    </Pressable>
+                  ))}
+                  <Pressable style={s.shotBtnMiss} onPress={registerCalledShotMiss}>
+                    <Text style={s.shotBtnText}>Miss</Text>
                   </Pressable>
-                ))}
-                <Pressable style={s.shotBtnMiss} onPress={registerCalledShotMiss}>
-                  <Text style={s.shotBtnText}>Miss</Text>
-                </Pressable>
-              </View>
-            ) : (
-              <View style={s.shotBtns}>
-                <Pressable style={s.shotBtnOn} onPress={() => registerShot(true)}>
-                  <Text style={s.shotBtnText}>Manual: On Target</Text>
-                </Pressable>
-                <Pressable style={s.shotBtnMiss} onPress={() => registerShot(false)}>
-                  <Text style={s.shotBtnText}>Manual: Missed</Text>
-                </Pressable>
-              </View>
-            )}
+                </View>
+              ) : (
+                <View style={s.shotBtns}>
+                  <Pressable style={s.shotBtnOn} onPress={() => registerShot(true)}>
+                    <Text style={s.shotBtnText}>Manual: On Target</Text>
+                  </Pressable>
+                  <Pressable style={s.shotBtnMiss} onPress={() => registerShot(false)}>
+                    <Text style={s.shotBtnText}>Manual: Missed</Text>
+                  </Pressable>
+                </View>
+              )
+            ) : null}
 
-            <Pressable style={s.btnSecondary} onPress={() => setPendingGameEnd({ reason: "quit" })}>
-              <Text style={s.btnSecondaryText}>End Game</Text>
-            </Pressable>
+            <View style={s.rowBtns}>
+              {phase === "live" ? (
+                <Pressable style={s.pauseBtn} onPress={isPaused ? resumeGame : pauseGame}>
+                  <Text style={s.btnSecondaryText}>{isPaused ? "Resume" : "Pause"}</Text>
+                </Pressable>
+              ) : null}
+              <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setPendingGameEnd({ reason: "quit" })}>
+                <Text style={s.btnSecondaryText}>End Game</Text>
+              </Pressable>
+            </View>
           </View>
+
+          {isPaused ? (
+            <View style={s.pausedBanner}>
+              <Text style={s.pausedTitle}>Paused</Text>
+              <Text style={s.pausedCopy}>Say "resume" or tap below.</Text>
+              <Pressable style={s.btnPrimaryWide} onPress={resumeGame}>
+                <Text style={s.btnPrimaryText}>Resume Game</Text>
+              </Pressable>
+            </View>
+          ) : null}
         </View>
       </View>
     );
@@ -1587,7 +1830,7 @@ export default function App() {
           <Pressable style={s.btnSecondary} onPress={() => shareStats(rec)}>
             <Text style={s.btnSecondaryText}>Share This Result</Text>
           </Pressable>
-          <Pressable style={s.btnPrimary} onPress={() => launchGame(rec.gameMode)}>
+          <Pressable style={s.btnPrimary} onPress={() => startGameFlow(rec.gameMode)}>
             <Text style={s.btnPrimaryText}>Play Again</Text>
           </Pressable>
           <Pressable style={s.btnSecondary} onPress={() => setScreen("games")}>
@@ -1656,6 +1899,72 @@ function IconBtn({ label, onPress }) {
     <Pressable style={s.iconBtn} onPress={onPress}>
       <Text style={s.iconText}>{label}</Text>
     </Pressable>
+  );
+}
+
+function NavIcon({ shape, active }) {
+  const color = active ? C.amber : C.steel;
+  if (shape === "menu") {
+    return (
+      <Svg width={22} height={22} viewBox="0 0 24 24">
+        <Rect x={3} y={5} width={18} height={2.4} rx={1.2} fill={color} />
+        <Rect x={3} y={10.8} width={18} height={2.4} rx={1.2} fill={color} />
+        <Rect x={3} y={16.6} width={18} height={2.4} rx={1.2} fill={color} />
+      </Svg>
+    );
+  }
+  if (shape === "games") {
+    return (
+      <Svg width={22} height={22} viewBox="0 0 24 24">
+        <Circle cx={12} cy={12} r={9} fill="none" stroke={color} strokeWidth={2} />
+        <Circle cx={12} cy={12} r={3.2} fill={color} />
+      </Svg>
+    );
+  }
+  if (shape === "sessions") {
+    return (
+      <Svg width={22} height={22} viewBox="0 0 24 24">
+        <Circle cx={12} cy={12} r={9} fill="none" stroke={color} strokeWidth={2} />
+        <Rect x={11} y={7} width={2} height={6} rx={1} fill={color} />
+        <Rect x={11} y={12} width={5} height={2} rx={1} fill={color} />
+      </Svg>
+    );
+  }
+  return (
+    <Svg width={22} height={22} viewBox="0 0 24 24">
+      <Circle cx={12} cy={12} r={3.4} fill="none" stroke={color} strokeWidth={2} />
+      <Circle cx={12} cy={4.5} r={1.6} fill={color} />
+      <Circle cx={12} cy={19.5} r={1.6} fill={color} />
+      <Circle cx={4.5} cy={12} r={1.6} fill={color} />
+      <Circle cx={19.5} cy={12} r={1.6} fill={color} />
+    </Svg>
+  );
+}
+
+function BottomNav({ active, onNavigate }) {
+  const tabs = [
+    { key: "menu", label: "Main Menu", shape: "menu" },
+    { key: "games", label: "Games", shape: "games" },
+    { key: "sessions", label: "History", shape: "sessions" },
+    { key: "settings", label: "Settings", shape: "settings" },
+  ];
+  const activeTab = active === "highscores" ? "games" : active;
+  if (!SCREENS_WITH_NAV.includes(active)) return null;
+  return (
+    <SafeAreaView style={s.navSafe} edges={["bottom"]}>
+      <View style={s.navBar}>
+        {tabs.map((t) => {
+          const isActive = t.key === activeTab;
+          return (
+            <Pressable key={t.key} style={s.navItem} onPress={() => onNavigate(t.key)}>
+              <NavIcon shape={t.shape} active={isActive} />
+              <Text style={[s.navLabel, isActive && s.navLabelActive]}>{t.label}</Text>
+              {isActive ? <View style={s.navDot} /> : null}
+            </Pressable>
+          );
+        })}
+      </View>
+    </SafeAreaView>
   );
 }
 
@@ -1780,7 +2089,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "1. Set Up Your Net",
-    body: "Tap the top-left, then bottom-right corner of your net opening to mark the area the camera should watch.",
+    body: "Before every session or game, tap the top-left then bottom-right corner of your net opening to mark the area the camera should watch.",
   },
   {
     title: "2. Place Targets",
@@ -1788,7 +2097,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "3. Shoot",
-    body: "Turn on Auto-Detect and the app will watch for pucks entering the net and score hits automatically. You can also log shots manually with the on-screen buttons.",
+    body: "In a free session, turn on Auto-Detect and the app watches for pucks entering the net. In games, auto-detect is on by default - say \"start\" or tap Start to begin the countdown, and say \"pause\" any time to freeze the clock.",
   },
   {
     title: "4. Build a Streak",
@@ -1838,18 +2147,24 @@ const s = StyleSheet.create({
   cameraRoot: { flex: 1, backgroundColor: "#000" },
   cameraFill: { flex: 1 },
   center: { justifyContent: "center", alignItems: "center", gap: 14, padding: 30 },
-  menuPad: { paddingHorizontal: 20, paddingTop: 26, paddingBottom: 40, gap: 16 },
+  menuPad: { paddingHorizontal: 20, paddingTop: 26, paddingBottom: 110, gap: 16 },
   brand: { flexDirection: "row", alignItems: "center", gap: 12, marginBottom: -4 },
-  brandTitle: { color: C.ice, fontSize: 34, fontWeight: "700", textTransform: "uppercase" },
-  subtitle: { color: C.steel, fontSize: 13, marginTop: -6, marginBottom: 6 },
+  brandTitle: { color: C.ice, fontSize: 34, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.5 },
+  subtitle: { color: C.steel, fontSize: 13, marginTop: -6, marginBottom: 6, lineHeight: 19 },
+  sectionLabel: { color: C.amber, fontSize: 12, fontWeight: "800", textTransform: "uppercase", letterSpacing: 1.4, marginTop: 4, marginBottom: -6 },
   card: {
     position: "relative",
     backgroundColor: C.slate2,
-    borderRadius: 14,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: C.line,
     padding: 18,
     overflow: "hidden",
+    shadowColor: "#000",
+    shadowOpacity: 0.25,
+    shadowOffset: { width: 0, height: 4 },
+    shadowRadius: 10,
+    elevation: 3,
   },
   cardAccent: { position: "absolute", top: 0, left: 18, right: 70, height: 3, backgroundColor: C.amber, borderBottomRightRadius: 2 },
   cardHeader: { color: C.steel, fontSize: 11, letterSpacing: 1.2, fontWeight: "700", textTransform: "uppercase", marginBottom: 14 },
@@ -1859,15 +2174,18 @@ const s = StyleSheet.create({
   statLbl: { color: C.steel, fontSize: 10.5, marginTop: 4, textTransform: "uppercase", textAlign: "center" },
   empty: { color: C.steel, fontSize: 14, textAlign: "center", paddingVertical: 10 },
   metaLine: { color: C.steel, fontSize: 12, marginTop: 12, textAlign: "center" },
+  metaTag: { color: C.violet, fontSize: 11, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 10 },
   centerMeta: { color: C.steel, fontSize: 11, textAlign: "center", textTransform: "uppercase", letterSpacing: 1.2 },
   careerAccuracy: { color: C.cyan, fontSize: 28, fontWeight: "700", textAlign: "center", marginTop: 14 },
   cameraIcon: { color: C.amber, fontSize: 28, fontWeight: "700" },
   errorText: { color: C.steel, textAlign: "center", fontSize: 15, lineHeight: 22 },
-  btnPrimary: { backgroundColor: C.amber, borderRadius: 12, padding: 18, alignItems: "center" },
-  btnPrimaryWide: { backgroundColor: C.amber, borderRadius: 12, padding: 18, alignItems: "center", minWidth: 220 },
-  btnPrimaryText: { color: "#1a1204", fontWeight: "700", fontSize: 16 },
-  btnSecondary: { backgroundColor: C.slate2, borderColor: C.line, borderWidth: 1, borderRadius: 12, padding: 16, alignItems: "center" },
+  btnPrimary: { backgroundColor: C.amber, borderRadius: 14, padding: 18, alignItems: "center" },
+  btnPrimaryWide: { backgroundColor: C.amber, borderRadius: 14, padding: 18, alignItems: "center", minWidth: 220 },
+  btnPrimaryText: { color: "#1a1204", fontWeight: "800", fontSize: 16, letterSpacing: 0.3 },
+  btnSecondary: { backgroundColor: C.slate2, borderColor: C.line, borderWidth: 1, borderRadius: 14, padding: 16, alignItems: "center" },
   btnSecondaryText: { color: C.ice, fontWeight: "700", fontSize: 14 },
+  btnDanger: { backgroundColor: "rgba(209,73,91,0.12)", borderColor: "rgba(209,73,91,0.5)", borderWidth: 1, borderRadius: 14, padding: 16, alignItems: "center" },
+  btnDangerText: { color: C.crimson, fontWeight: "800", fontSize: 14 },
   disabled: { opacity: 0.4 },
   flexOne: { flex: 1 },
   topbar: {
@@ -1919,8 +2237,15 @@ const s = StyleSheet.create({
   pausedBanner: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(6,10,15,0.85)", alignItems: "center", justifyContent: "center", gap: 16, padding: 30 },
   pausedTitle: { color: C.ice, fontSize: 32, fontWeight: "700", textTransform: "uppercase" },
   pausedCopy: { color: C.steel, fontSize: 14, textAlign: "center" },
+  armedOverlay: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center", gap: 18, backgroundColor: "rgba(6,10,15,0.55)", padding: 30 },
+  armedTitle: { color: C.ice, fontSize: 26, fontWeight: "800", textAlign: "center" },
+  armedCopy: { color: C.steel, fontSize: 14, textAlign: "center", lineHeight: 20, maxWidth: 300 },
+  startBtn: { backgroundColor: C.amber, borderRadius: 40, paddingVertical: 20, paddingHorizontal: 56, marginTop: 6 },
+  startBtnText: { color: "#1a1204", fontWeight: "800", fontSize: 20, letterSpacing: 1 },
+  countdownBig: { color: C.amber, fontSize: 160, fontWeight: "800", textShadowColor: "rgba(0,0,0,0.6)", textShadowRadius: 16 },
   summaryHero: { alignItems: "center", paddingVertical: 4 },
   summaryAccuracy: { color: C.amber, fontSize: 50, fontWeight: "700" },
+  summaryAccuracyMed: { color: C.amber, fontSize: 34, fontWeight: "800" },
   streakBanner: { backgroundColor: "rgba(226,166,59,0.14)", borderColor: "rgba(226,166,59,0.4)", borderWidth: 1, borderRadius: 12, paddingVertical: 10, alignItems: "center" },
   streakText: { color: C.amber, fontWeight: "700", fontSize: 14, textTransform: "uppercase", letterSpacing: 0.5 },
   shareLink: { marginTop: 14, alignItems: "center", paddingVertical: 6 },
@@ -1935,8 +2260,8 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: C.line,
   },
-  topbarTitleDark: { color: C.ice, fontSize: 17, fontWeight: "700", flex: 1, textAlign: "center", textTransform: "uppercase" },
-  sessionRowHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
+  topbarTitleDark: { color: C.ice, fontSize: 17, fontWeight: "800", flex: 1, textAlign: "center", textTransform: "uppercase", letterSpacing: 0.4 },
+  sessionRowHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 },
   sessionRowDate: { color: C.steel, fontSize: 12 },
   sessionRowAccuracy: { color: C.amber, fontSize: 16, fontWeight: "700" },
   dragTarget: {
@@ -1977,4 +2302,18 @@ const s = StyleSheet.create({
   calledShotBtnGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "center" },
   calledShotNumBtn: { width: 52, height: 52, borderRadius: 26, backgroundColor: C.amber, alignItems: "center", justifyContent: "center" },
   calledShotNumBtnText: { color: "#1a1204", fontWeight: "700", fontSize: 18 },
+  navSafe: { position: "absolute", left: 0, right: 0, bottom: 0, backgroundColor: C.slate },
+  navBar: {
+    flexDirection: "row",
+    backgroundColor: C.slate,
+    borderTopWidth: 1,
+    borderTopColor: C.line,
+    paddingTop: 10,
+    paddingBottom: 8,
+    paddingHorizontal: 6,
+  },
+  navItem: { flex: 1, alignItems: "center", gap: 4, paddingVertical: 2 },
+  navLabel: { color: C.steel, fontSize: 10.5, fontWeight: "700" },
+  navLabelActive: { color: C.amber },
+  navDot: { position: "absolute", top: -10, width: 18, height: 3, borderRadius: 2, backgroundColor: C.amber },
 });
