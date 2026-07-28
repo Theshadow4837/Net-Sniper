@@ -19,6 +19,7 @@ import Svg, { Circle, Defs, Ellipse, LinearGradient, Rect, Stop, Text as SvgText
 import { Worklets } from "react-native-worklets-core";
 import { Camera, useCameraDevices, useCameraPermission, useFrameProcessor } from "react-native-vision-camera";
 import { runAtTargetFps } from "react-native-vision-camera";
+import * as Speech from "expo-speech";
 
 const C = {
   arena: "#0A121C",
@@ -39,6 +40,7 @@ const K_SESSIONS = "netsniper:sessions";
 const K_SETTINGS = "netsniper:settings";
 const K_STREAK = "netsniper:streak";
 const K_TUTORIAL_SEEN = "netsniper:tutorialSeen";
+const K_BEST_PERFECT10 = "netsniper:bestPerfect10";
 const REF_WIDTH = 380;
 // Detection tuning defaults. These are now user-adjustable in the Settings
 // screen; these values are exactly what the app previously hardcoded, so
@@ -59,6 +61,16 @@ const MIN_GRID = 14;
 const MAX_GRID_COLS = 64;
 const MAX_GRID_ROWS = 48;
 const DEFAULT_TARGET_RADIUS = 34;
+const TIME_ATTACK_DURATIONS = [15, 30, 60, 90];
+const CALLED_SHOT_START_MS = 4000;
+const CALLED_SHOT_MIN_MS = 1200;
+const CALLED_SHOT_STEP_MS = 200;
+const GAME_INFO = {
+  timeAttack: { title: "Time Attack", blurb: "Pick a clock and rack up as many On Target hits as you can before it runs out." },
+  suddenDeath: { title: "Sudden Death", blurb: "Your streak climbs with every hit. One missed shot ends the run." },
+  perfect10: { title: "Perfect 10", blurb: "10 shots, one accuracy %. Try to beat your personal best." },
+  calledShot: { title: "Called Shot", blurb: "A number is called out - hit that exact target before time runs out. Gets faster each round." },
+};
 
 function pct(on, total) {
   return total ? Math.round((on / total) * 100) : 0;
@@ -124,7 +136,16 @@ export default function App() {
   const [autoStatusText, setAutoStatusText] = useState("Manual Mode");
   const [freshDevices, setFreshDevices] = useState([]);
 
+  const [gameMode, setGameMode] = useState(null);
+  const [pendingGameMode, setPendingGameMode] = useState(null);
+  const [timeAttackDuration, setTimeAttackDuration] = useState(30);
+  const [gameLive, setGameLive] = useState(null);
+  const [pendingGameEnd, setPendingGameEnd] = useState(null);
+  const [gameSummaryRec, setGameSummaryRec] = useState(null);
+  const [bestPerfect10, setBestPerfect10] = useState(0);
+
   const timerRef = useRef(null);
+  const gameTimerRef = useRef(null);
   const pauseStartRef = useRef(0);
 
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -149,7 +170,36 @@ export default function App() {
   }, [device]);
   const maxFps = format?.maxFps ? Math.round(format.maxFps) : null;
 
-  const onFrameShot = useMemo(() => Worklets.createRunOnJS((hit) => {
+  function startCalledShotRound(limitMs, roundsCompleted) {
+    setGameLive((g) => {
+      if (!g || targets.length === 0) return g;
+      const idx = Math.floor(Math.random() * targets.length);
+      try {
+        Speech.speak(String(idx + 1), { rate: 1.0 });
+      } catch {
+        // Speech is best-effort - the huge on-screen number is the fallback.
+      }
+      if (gameTimerRef.current) clearInterval(gameTimerRef.current);
+      const endAt = Date.now() + limitMs;
+      gameTimerRef.current = setInterval(() => {
+        setGameLive((cur) => {
+          if (!cur || cur.awaitingNext || cur.ended) return cur;
+          const remain = endAt - Date.now();
+          if (remain <= 0) {
+            clearInterval(gameTimerRef.current);
+            setPendingGameEnd({ reason: "timeout" });
+            return { ...cur, roundRemainingMs: 0, ended: true };
+          }
+          return { ...cur, roundRemainingMs: remain };
+        });
+      }, 100);
+      return { ...g, calledIndex: idx, roundLimitMs: limitMs, roundRemainingMs: limitMs, roundsCompleted, awaitingNext: false };
+    });
+  }
+
+  const handleShotResult = useCallback((hitIndex) => {
+    if (isPaused) return;
+    const hit = hitIndex >= 0;
     setCurrent((cur) => {
       if (!cur) return cur;
       return {
@@ -161,11 +211,57 @@ export default function App() {
     });
     setFlash({ hit, at: Date.now() });
     setTimeout(() => setFlash(null), 350);
-    setAutoStatusText(hit ? "Target hit" : "Shot missed");
-    setTimeout(() => {
-      setAutoStatusText(autoDetectOn ? "Watching" : "Manual Mode");
-    }, 650);
-  }), [autoDetectOn]);
+
+    if (!gameMode) {
+      setAutoStatusText(hit ? "Target hit" : "Shot missed");
+      setTimeout(() => {
+        setAutoStatusText(autoDetectOn ? "Watching" : "Manual Mode");
+      }, 650);
+      return;
+    }
+
+    if (gameMode === "suddenDeath") {
+      if (hit) {
+        setGameLive((g) => (g ? { ...g, streak: g.streak + 1 } : g));
+      } else {
+        setPendingGameEnd({ reason: "missed" });
+      }
+      return;
+    }
+
+    if (gameMode === "perfect10") {
+      setGameLive((g) => {
+        if (!g) return g;
+        const shots = g.shots + 1;
+        if (shots >= 10) setTimeout(() => setPendingGameEnd({ reason: "complete" }), 0);
+        return { ...g, shots };
+      });
+      return;
+    }
+
+    if (gameMode === "calledShot") {
+      setGameLive((g) => {
+        if (!g || g.ended) return g;
+        if (hitIndex === g.calledIndex) {
+          const nextLimit = Math.max(CALLED_SHOT_MIN_MS, g.roundLimitMs - CALLED_SHOT_STEP_MS);
+          const roundsCompleted = g.roundsCompleted + 1;
+          if (gameTimerRef.current) clearInterval(gameTimerRef.current);
+          setTimeout(() => startCalledShotRound(nextLimit, roundsCompleted), 300);
+          return { ...g, roundsCompleted, roundLimitMs: nextLimit, awaitingNext: true };
+        }
+        // Wrong target (or a miss) doesn't end the round - only the round
+        // timer running out does. This keeps the game readable: you always
+        // know exactly why a round ended.
+        return g;
+      });
+      return;
+    }
+    // Time Attack needs no extra branching - the countdown timer ends it.
+  }, [isPaused, gameMode, autoDetectOn, targets.length]);
+
+  const onFrameShot = useMemo(() => Worklets.createRunOnJS((hitIndex) => {
+    handleShotResult(hitIndex);
+  }), [handleShotResult]);
 
   const frameProcessor = useFrameProcessor((frame) => {
     "worklet";
@@ -185,7 +281,7 @@ export default function App() {
         global.__netSniperState = "idle";
         global.__netSniperOnsetCount = 0;
         global.__netSniperQuietCount = 0;
-        global.__netSniperActiveHit = false;
+        global.__netSniperActiveHitIndex = -1;
         global.__netSniperCooldownUntil = 0;
         return;
       }
@@ -315,7 +411,7 @@ export default function App() {
           const rNorm = ((t.radius || 34) / REF_WIDTH) * cfg.hitRadiusMult;
           const dx = toX - t.x;
           const dy = toY - t.y;
-          if (Math.sqrt(dx * dx + dy * dy) <= rNorm) return true;
+          if (Math.sqrt(dx * dx + dy * dy) <= rNorm) return i;
           if (fromCentroid) {
             const segSteps = 4;
             for (let step = 1; step <= segSteps; step += 1) {
@@ -323,11 +419,11 @@ export default function App() {
               const fy = fromCentroid.y + ((toY - fromCentroid.y) * step) / segSteps;
               const ddx = fx - t.x;
               const ddy = fy - t.y;
-              if (Math.sqrt(ddx * ddx + ddy * ddy) <= rNorm) return true;
+              if (Math.sqrt(ddx * ddx + ddy * ddy) <= rNorm) return i;
             }
           }
         }
-        return false;
+        return -1;
       };
 
       if (!isMotion) {
@@ -338,13 +434,13 @@ export default function App() {
           if (quiet >= cfg.motionEndQuietFrames) {
             // Motion has fully stopped - the shot is over. Finalize it exactly
             // once, whether or not it ever registered as a hit.
-            const finalHit = !!global.__netSniperActiveHit;
+            const finalHitIndex = global.__netSniperActiveHitIndex === undefined ? -1 : global.__netSniperActiveHitIndex;
             global.__netSniperState = "idle";
-            global.__netSniperActiveHit = false;
+            global.__netSniperActiveHitIndex = -1;
             global.__netSniperQuietCount = 0;
             global.__netSniperOnsetCount = 0;
             global.__netSniperCooldownUntil = now + cfg.shotCooldownMs;
-            onFrameShot(finalHit);
+            onFrameShot(finalHitIndex);
           }
         } else {
           global.__netSniperOnsetCount = 0;
@@ -361,7 +457,7 @@ export default function App() {
           // Confirmed as a real shot starting, not a single-frame flicker.
           global.__netSniperState = "active";
           global.__netSniperQuietCount = 0;
-          global.__netSniperActiveHit = checkHit(undefined, cx, cy);
+          global.__netSniperActiveHitIndex = checkHit(undefined, cx, cy);
         }
         return;
       }
@@ -371,8 +467,9 @@ export default function App() {
       // treating each frame as its own shot.
       const prevCentroid = global.__netSniperPrevCentroid;
       global.__netSniperQuietCount = 0;
-      if (!global.__netSniperActiveHit && checkHit(prevCentroid, cx, cy)) {
-        global.__netSniperActiveHit = true;
+      if ((global.__netSniperActiveHitIndex === undefined || global.__netSniperActiveHitIndex < 0)) {
+        const idx = checkHit(prevCentroid, cx, cy);
+        if (idx >= 0) global.__netSniperActiveHitIndex = idx;
       }
       global.__netSniperPrevCentroid = { x: cx, y: cy };
     });
@@ -402,13 +499,14 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [t, l, sess, set, str, tut] = await Promise.all([
+        const [t, l, sess, set, str, tut, best] = await Promise.all([
           AsyncStorage.getItem(K_TOTALS),
           AsyncStorage.getItem(K_LATEST),
           AsyncStorage.getItem(K_SESSIONS),
           AsyncStorage.getItem(K_SETTINGS),
           AsyncStorage.getItem(K_STREAK),
           AsyncStorage.getItem(K_TUTORIAL_SEEN),
+          AsyncStorage.getItem(K_BEST_PERFECT10),
         ]);
         if (t) setTotals(JSON.parse(t));
         if (l) setLatest(JSON.parse(l));
@@ -416,6 +514,7 @@ export default function App() {
         if (set) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(set) });
         if (str) setStreak(JSON.parse(str));
         if (!tut) setShowTutorial(true);
+        if (best) setBestPerfect10(JSON.parse(best));
       } catch {
         // Bad saved data should not block opening the app.
       }
@@ -428,6 +527,7 @@ export default function App() {
 
   useEffect(() => () => {
     if (timerRef.current) clearInterval(timerRef.current);
+    if (gameTimerRef.current) clearInterval(gameTimerRef.current);
   }, []);
 
   const radiusPx = useCallback((r, width) => (r / REF_WIDTH) * width, []);
@@ -528,6 +628,12 @@ export default function App() {
   }
 
   function beginSession() {
+    if (pendingGameMode) {
+      const mode = pendingGameMode;
+      setPendingGameMode(null);
+      launchGame(mode);
+      return;
+    }
     const next = { totalShots: 0, onTarget: 0, missed: 0, startTime: Date.now(), pausedAccum: 0 };
     setCurrent(next);
     setElapsed(0);
@@ -547,14 +653,17 @@ export default function App() {
 
   function registerShot(hit) {
     if (isPaused || !current) return;
-    setCurrent((cur) => ({
-      ...cur,
-      totalShots: cur.totalShots + 1,
-      onTarget: cur.onTarget + (hit ? 1 : 0),
-      missed: cur.missed + (hit ? 0 : 1),
-    }));
-    setFlash({ hit, at: Date.now() });
-    setTimeout(() => setFlash(null), 350);
+    handleShotResult(hit ? 0 : -1);
+  }
+
+  function registerCalledShotTarget(index) {
+    if (isPaused || !current) return;
+    handleShotResult(index);
+  }
+
+  function registerCalledShotMiss() {
+    if (isPaused || !current) return;
+    handleShotResult(-1);
   }
 
   function pauseSession() {
@@ -635,6 +744,145 @@ export default function App() {
     ]);
   }
 
+  function startGameFlow(mode) {
+    if (targets.length === 0) {
+      setPendingGameMode(mode);
+      resetSetup();
+      setScreen("setup");
+    } else {
+      launchGame(mode);
+    }
+  }
+
+  function launchGame(mode) {
+    if (mode === "timeAttack") startTimeAttack(timeAttackDuration);
+    else if (mode === "suddenDeath") startSuddenDeath();
+    else if (mode === "perfect10") startPerfect10();
+    else if (mode === "calledShot") startCalledShot();
+  }
+
+  function beginGameCommon(mode, live) {
+    const next = { totalShots: 0, onTarget: 0, missed: 0, startTime: Date.now(), pausedAccum: 0 };
+    setCurrent(next);
+    setIsPaused(false);
+    setAutoDetectOn(false);
+    setAutoStatusText("Manual Mode");
+    setGameMode(mode);
+    setGameLive(live);
+    setScreen("game");
+  }
+
+  function startTimeAttack(durationSec) {
+    beginGameCommon("timeAttack", { remainingMs: durationSec * 1000, durationMs: durationSec * 1000 });
+    if (gameTimerRef.current) clearInterval(gameTimerRef.current);
+    const endAt = Date.now() + durationSec * 1000;
+    gameTimerRef.current = setInterval(() => {
+      const remain = endAt - Date.now();
+      if (remain <= 0) {
+        clearInterval(gameTimerRef.current);
+        setGameLive((g) => (g ? { ...g, remainingMs: 0 } : g));
+        setPendingGameEnd({ reason: "time" });
+      } else {
+        setGameLive((g) => (g ? { ...g, remainingMs: remain } : g));
+      }
+    }, 100);
+  }
+
+  function startSuddenDeath() {
+    beginGameCommon("suddenDeath", { streak: 0 });
+  }
+
+  function startPerfect10() {
+    beginGameCommon("perfect10", { shots: 0 });
+  }
+
+  function startCalledShot() {
+    beginGameCommon("calledShot", {
+      calledIndex: null,
+      roundLimitMs: CALLED_SHOT_START_MS,
+      roundRemainingMs: CALLED_SHOT_START_MS,
+      roundsCompleted: 0,
+      ended: false,
+      awaitingNext: false,
+    });
+    setTimeout(() => startCalledShotRound(CALLED_SHOT_START_MS, 0), 600);
+  }
+
+  useEffect(() => {
+    if (!pendingGameEnd || !current) return;
+    finalizeGame(pendingGameEnd.reason);
+    setPendingGameEnd(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingGameEnd]);
+
+  async function finalizeGame(reason) {
+    if (!current) return;
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (gameTimerRef.current) clearInterval(gameTimerRef.current);
+    const duration = (Date.now() - current.startTime - current.pausedAccum) / 1000;
+    const rec = {
+      totalShots: current.totalShots,
+      onTarget: current.onTarget,
+      missed: current.missed,
+      duration,
+      targetsUsed: targets.length,
+      date: Date.now(),
+      gameMode,
+      endReason: reason,
+    };
+    let newBestPerfect10 = bestPerfect10;
+    if (gameMode === "timeAttack") {
+      rec.gameScore = current.onTarget;
+    } else if (gameMode === "suddenDeath") {
+      rec.gameScore = gameLive ? gameLive.streak : 0;
+    } else if (gameMode === "perfect10") {
+      rec.gameScore = pct(current.onTarget, current.totalShots);
+      if (rec.gameScore > bestPerfect10) {
+        newBestPerfect10 = rec.gameScore;
+        setBestPerfect10(newBestPerfect10);
+        AsyncStorage.setItem(K_BEST_PERFECT10, JSON.stringify(newBestPerfect10)).catch(() => {});
+      }
+    } else if (gameMode === "calledShot") {
+      rec.gameScore = gameLive ? gameLive.roundsCompleted : 0;
+    }
+
+    const newTotals = {
+      totalShots: totals.totalShots + rec.totalShots,
+      onTarget: totals.onTarget + rec.onTarget,
+      missed: totals.missed + rec.missed,
+    };
+    const newLog = [...sessionsLog, rec].slice(-100);
+
+    let newStreak = streak;
+    if (rec.totalShots >= 5) {
+      const now = new Date();
+      const today = dateKeyFor(now);
+      if (streak.lastDate === today) {
+        newStreak = streak;
+      } else if (isConsecutiveDay(streak.lastDate, now)) {
+        newStreak = { count: (streak.count || 0) + 1, lastDate: today };
+      } else {
+        newStreak = { count: 1, lastDate: today };
+      }
+      setStreak(newStreak);
+    }
+
+    setTotals(newTotals);
+    setLatest(rec);
+    setSessionsLog(newLog);
+    setCurrent(null);
+    setGameSummaryRec(rec);
+    setGameMode(null);
+    setGameLive(null);
+    await Promise.all([
+      AsyncStorage.setItem(K_TOTALS, JSON.stringify(newTotals)),
+      AsyncStorage.setItem(K_LATEST, JSON.stringify(rec)),
+      AsyncStorage.setItem(K_SESSIONS, JSON.stringify(newLog)),
+      AsyncStorage.setItem(K_STREAK, JSON.stringify(newStreak)),
+    ]);
+    setScreen("gameSummary");
+  }
+
   if (screen === "menu") {
     const displayStreak = computeDisplayStreak(streak, new Date());
     return (
@@ -681,6 +929,9 @@ export default function App() {
 
           <Pressable style={s.btnPrimary} onPress={enterSetup}>
             <Text style={s.btnPrimaryText}>Start Shooting Session</Text>
+          </Pressable>
+          <Pressable style={s.btnPrimary} onPress={() => setScreen("games")}>
+            <Text style={s.btnPrimaryText}>Play a Game</Text>
           </Pressable>
           <View style={s.rowBtns}>
             <Pressable style={[s.btnSecondary, s.flexOne]} onPress={() => setScreen("sessions")}>
@@ -788,8 +1039,8 @@ export default function App() {
             : null}
 
           <View style={s.topbar}>
-            <IconBtn label="<" onPress={() => setScreen("menu")} />
-            <Text style={s.topbarTitle}>Set Up Net & Targets</Text>
+            <IconBtn label="<" onPress={() => { setPendingGameMode(null); setScreen("menu"); }} />
+            <Text style={s.topbarTitle}>{pendingGameMode ? "Set Up for Game" : "Set Up Net & Targets"}</Text>
             <IconBtn label="Flip" onPress={() => setFacing((f) => (f === "back" ? "front" : "back"))} />
             <IconBtn label="X" onPress={resetSetup} />
           </View>
@@ -844,7 +1095,7 @@ export default function App() {
                 disabled={!canBegin}
                 onPress={beginSession}
               >
-                <Text style={s.btnPrimaryText}>Begin Session</Text>
+                <Text style={s.btnPrimaryText}>{pendingGameMode ? "Start Game" : "Begin Session"}</Text>
               </Pressable>
             </View>
           </View>
@@ -1113,6 +1364,237 @@ export default function App() {
           />
           <Pressable style={s.btnSecondary} onPress={resetSettingsToDefault}>
             <Text style={s.btnSecondaryText}>Reset to Defaults</Text>
+          </Pressable>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (screen === "games") {
+    return (
+      <SafeAreaView style={s.root}>
+        <ExpoStatusBar style="light" />
+        <View style={s.topbarStatic}>
+          <IconBtn label="<" onPress={() => setScreen("menu")} />
+          <Text style={s.topbarTitleDark}>Games</Text>
+          <View style={{ width: 38 }} />
+        </View>
+        <ScrollView contentContainerStyle={s.menuPad}>
+          <Text style={s.subtitle}>
+            {targets.length === 0
+              ? "No targets placed yet - picking a game will walk you through a quick setup first."
+              : `Using your current setup - ${targets.length} target(s) placed.`}
+          </Text>
+
+          <Card title={GAME_INFO.timeAttack.title}>
+            <Text style={s.gameBlurb}>{GAME_INFO.timeAttack.blurb}</Text>
+            <View style={s.durationRow}>
+              {TIME_ATTACK_DURATIONS.map((d) => (
+                <Pressable
+                  key={d}
+                  style={[s.durationChip, timeAttackDuration === d && s.durationChipActive]}
+                  onPress={() => setTimeAttackDuration(d)}
+                >
+                  <Text style={[s.durationChipText, timeAttackDuration === d && s.durationChipTextActive]}>{d}s</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable style={s.btnPrimary} onPress={() => startGameFlow("timeAttack")}>
+              <Text style={s.btnPrimaryText}>Play Time Attack</Text>
+            </Pressable>
+          </Card>
+
+          <Card title={GAME_INFO.suddenDeath.title}>
+            <Text style={s.gameBlurb}>{GAME_INFO.suddenDeath.blurb}</Text>
+            <Pressable style={s.btnPrimary} onPress={() => startGameFlow("suddenDeath")}>
+              <Text style={s.btnPrimaryText}>Play Sudden Death</Text>
+            </Pressable>
+          </Card>
+
+          <Card title={GAME_INFO.perfect10.title}>
+            <Text style={s.gameBlurb}>{GAME_INFO.perfect10.blurb}</Text>
+            {bestPerfect10 > 0 ? <Text style={s.metaLine}>Best: {bestPerfect10}%</Text> : null}
+            <Pressable style={s.btnPrimary} onPress={() => startGameFlow("perfect10")}>
+              <Text style={s.btnPrimaryText}>Play Perfect 10</Text>
+            </Pressable>
+          </Card>
+
+          <Card title={GAME_INFO.calledShot.title}>
+            <Text style={s.gameBlurb}>{GAME_INFO.calledShot.blurb}</Text>
+            <Pressable style={s.btnPrimary} onPress={() => startGameFlow("calledShot")}>
+              <Text style={s.btnPrimaryText}>Play Called Shot</Text>
+            </Pressable>
+          </Card>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (screen === "game" && device && hasPermission) {
+    const live = gameLive || {};
+    return (
+      <View style={s.cameraRoot}>
+        <ExpoStatusBar style="light" />
+        <View
+          style={s.cameraFill}
+          onLayout={(e) => setLayout({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height })}
+        >
+          <Camera
+            style={StyleSheet.absoluteFill}
+            device={device}
+            format={format}
+            fps={maxFps || undefined}
+            isActive={screen === "game"}
+            pixelFormat="yuv"
+            frameProcessor={autoDetectOn ? frameProcessor : undefined}
+          />
+          <Svg style={StyleSheet.absoluteFill}>
+            <NetAndTargets netBox={netBox} targets={targets} w={layout.w} h={layout.h} flash={flash} />
+          </Svg>
+
+          <View style={s.hudTop}>
+            <Text style={s.timerText}>{GAME_INFO[gameMode]?.title}</Text>
+            <Text style={[s.autoStatus, autoDetectOn ? s.autoOn : s.autoOff]}>{autoStatusText}</Text>
+          </View>
+
+          {gameMode === "timeAttack" ? (
+            <View style={s.hudStats}>
+              <Pill n={fmtMMSS(Math.ceil((live.remainingMs || 0) / 1000))} l="Time Left" c={C.cyan} />
+              <Pill n={current?.onTarget ?? 0} l="On Target" c={C.green} />
+              <Pill n={current?.missed ?? 0} l="Missed" c={C.crimson} />
+            </View>
+          ) : null}
+
+          {gameMode === "suddenDeath" ? (
+            <View style={s.hudStats}>
+              <Pill n={live.streak ?? 0} l="Streak" c={C.amber} />
+              <Pill n={current?.totalShots ?? 0} l="Shots" c={C.ice} />
+            </View>
+          ) : null}
+
+          {gameMode === "perfect10" ? (
+            <View style={s.hudStats}>
+              <Pill n={`${live.shots ?? 0}/10`} l="Shots" c={C.ice} />
+              <Pill n={`${pct(current?.onTarget ?? 0, current?.totalShots ?? 0)}%`} l="Accuracy" c={C.amber} />
+            </View>
+          ) : null}
+
+          {gameMode === "calledShot" ? (
+            <View style={s.hudStats}>
+              <Pill n={live.roundsCompleted ?? 0} l="Rounds" c={C.amber} />
+              <Pill n={`${(((live.roundLimitMs ?? CALLED_SHOT_START_MS)) / 1000).toFixed(1)}s`} l="Round Limit" c={C.cyan} />
+            </View>
+          ) : null}
+
+          {gameMode === "calledShot" && live.calledIndex != null ? (
+            <View style={s.calledShotOverlay} pointerEvents="none">
+              <Text style={s.calledShotBig}>{live.calledIndex + 1}</Text>
+              <View style={s.calledShotBarTrack}>
+                <View
+                  style={[
+                    s.calledShotBarFill,
+                    { width: `${Math.max(0, Math.min(100, ((live.roundRemainingMs || 0) / (live.roundLimitMs || 1)) * 100))}%` },
+                  ]}
+                />
+              </View>
+            </View>
+          ) : null}
+
+          <View style={s.hudBottom}>
+            <View style={s.toggleRow}>
+              <Pressable
+                style={s.toggleBtn}
+                onPress={() => {
+                  setAutoDetectOn((v) => {
+                    const next = !v;
+                    setAutoStatusText(next ? "Watching" : "Manual Mode");
+                    return next;
+                  });
+                }}
+              >
+                <Text style={s.toggleText}>Auto-Detect: {autoDetectOn ? "ON" : "OFF"}</Text>
+              </Pressable>
+              <Pressable style={s.toggleBtn} onPress={() => setFacing((f) => (f === "back" ? "front" : "back"))}>
+                <Text style={s.toggleText}>Flip Camera</Text>
+              </Pressable>
+            </View>
+
+            {gameMode === "calledShot" ? (
+              <View style={s.calledShotBtnGrid}>
+                {targets.map((t, i) => (
+                  <Pressable key={i} style={s.calledShotNumBtn} onPress={() => registerCalledShotTarget(i)}>
+                    <Text style={s.calledShotNumBtnText}>{i + 1}</Text>
+                  </Pressable>
+                ))}
+                <Pressable style={s.shotBtnMiss} onPress={registerCalledShotMiss}>
+                  <Text style={s.shotBtnText}>Miss</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <View style={s.shotBtns}>
+                <Pressable style={s.shotBtnOn} onPress={() => registerShot(true)}>
+                  <Text style={s.shotBtnText}>Manual: On Target</Text>
+                </Pressable>
+                <Pressable style={s.shotBtnMiss} onPress={() => registerShot(false)}>
+                  <Text style={s.shotBtnText}>Manual: Missed</Text>
+                </Pressable>
+              </View>
+            )}
+
+            <Pressable style={s.btnSecondary} onPress={() => setPendingGameEnd({ reason: "quit" })}>
+              <Text style={s.btnSecondaryText}>End Game</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    );
+  }
+
+  if (screen === "gameSummary" && gameSummaryRec) {
+    const rec = gameSummaryRec;
+    const info = GAME_INFO[rec.gameMode];
+    return (
+      <SafeAreaView style={s.root}>
+        <ExpoStatusBar style="light" />
+        <ScrollView contentContainerStyle={s.menuPad}>
+          <Brand title={info ? info.title : "Game Complete"} />
+          <Card>
+            <View style={s.summaryHero}>
+              <Text style={s.summaryAccuracy}>
+                {rec.gameMode === "perfect10" ? `${rec.gameScore}%` : rec.gameScore}
+              </Text>
+              <Text style={s.centerMeta}>
+                {rec.gameMode === "timeAttack" && "On Target Hits"}
+                {rec.gameMode === "suddenDeath" && "Final Streak"}
+                {rec.gameMode === "perfect10" && "Accuracy"}
+                {rec.gameMode === "calledShot" && "Rounds Completed"}
+              </Text>
+            </View>
+          </Card>
+          <Card>
+            <View style={s.statRow}>
+              <Stat n={rec.totalShots} l="Total Shots" c={C.amber} />
+              <Stat n={rec.onTarget} l="On Target" c={C.green} />
+              <Stat n={rec.missed} l="Missed" c={C.crimson} />
+            </View>
+          </Card>
+          <Card>
+            <View style={s.statRow}>
+              <Stat n={fmtMMSS(rec.duration)} l="Session Time" c={C.cyan} />
+              <Stat n={pct(rec.onTarget, rec.totalShots)} l="Accuracy %" c={C.ice} />
+            </View>
+          </Card>
+          <Pressable style={s.btnSecondary} onPress={() => shareStats(rec)}>
+            <Text style={s.btnSecondaryText}>Share This Result</Text>
+          </Pressable>
+          <Pressable style={s.btnPrimary} onPress={() => launchGame(rec.gameMode)}>
+            <Text style={s.btnPrimaryText}>Play Again</Text>
+          </Pressable>
+          <Pressable style={s.btnSecondary} onPress={() => setScreen("games")}>
+            <Text style={s.btnSecondaryText}>Back to Games</Text>
+          </Pressable>
+          <Pressable style={s.btnSecondary} onPress={() => setScreen("menu")}>
+            <Text style={s.btnSecondaryText}>Back to Main Menu</Text>
           </Pressable>
         </ScrollView>
       </SafeAreaView>
@@ -1482,4 +1964,17 @@ const s = StyleSheet.create({
   tutorialDots: { flexDirection: "row", justifyContent: "center", gap: 6 },
   tutorialDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: C.line },
   tutorialDotActive: { backgroundColor: C.amber },
+  gameBlurb: { color: C.steel, fontSize: 13, lineHeight: 19, marginBottom: 14 },
+  durationRow: { flexDirection: "row", gap: 8, marginBottom: 14 },
+  durationChip: { flex: 1, borderWidth: 1, borderColor: C.line, borderRadius: 10, paddingVertical: 10, alignItems: "center", backgroundColor: C.slate },
+  durationChipActive: { borderColor: C.amber, backgroundColor: "rgba(226,166,59,0.15)" },
+  durationChipText: { color: C.steel, fontWeight: "700", fontSize: 13 },
+  durationChipTextActive: { color: C.amber },
+  calledShotOverlay: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, alignItems: "center", justifyContent: "center", gap: 16 },
+  calledShotBig: { color: C.amber, fontSize: 140, fontWeight: "700", textShadowColor: "rgba(0,0,0,0.6)", textShadowRadius: 12 },
+  calledShotBarTrack: { width: "60%", height: 8, borderRadius: 4, backgroundColor: "rgba(255,255,255,0.15)", overflow: "hidden" },
+  calledShotBarFill: { height: "100%", backgroundColor: C.cyan },
+  calledShotBtnGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "center" },
+  calledShotNumBtn: { width: 52, height: 52, borderRadius: 26, backgroundColor: C.amber, alignItems: "center", justifyContent: "center" },
+  calledShotNumBtnText: { color: "#1a1204", fontWeight: "700", fontSize: 18 },
 });
